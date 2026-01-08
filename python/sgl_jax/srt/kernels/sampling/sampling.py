@@ -21,8 +21,12 @@ def topk_topp_and_sample(
   sampling_eps: float = 1e-5,
   replace_val: float = -1e12,
   filter_type: str = "sequential",
+  seed=None,
+  positions=None,
 ):
   """Combined top-k, top-p filtering, and sampling for vLLM inference.
+
+  Supports batch-invariant sampling when seed and positions are provided.
 
   Args:
     rng_key: RNG key for sampling.
@@ -34,6 +38,8 @@ def topk_topp_and_sample(
     sampling_eps: Use greedy token if temperature < eps
     replace_val: Replace padding entries in probabilities with constant
     filter_type: "sequential" (normalize across top-k only) or "joint" (normalize across full vocab)
+    seed: Optional batch-specific seeds for batch-invariant sampling.
+    positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
     Sampled token indices.
@@ -67,4 +73,6 @@ def topk_topp_and_sample(
     replace_val=replace_val,
     sampling_eps=sampling_eps,
     unnormalised_probs_sum=unnormalised_probs_sum,
+    seed=seed,
+    positions=positions,
   )

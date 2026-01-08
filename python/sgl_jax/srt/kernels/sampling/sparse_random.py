@@ -47,13 +47,15 @@ def _bits_to_uniform(bits, dtype):
 
 
 def sparse_random_uniform(
-  key_ref, indices, dim1_size, dtype=jnp.float32, minval=0.0, maxval=1.0
+  key_ref, indices, dim1_size, dtype=jnp.float32, minval=0.0, maxval=1.0, seed=None, positions=None
 ):
   """
   Generate uniform random numbers for sparse indices.
 
   Generates random values deterministically based on the indices, similar to
   stateless PRNGs but for specific sparse locations.
+
+  Supports batch-invariant sampling when seed and positions are provided.
 
   Args:
       key_ref: RNG key.
@@ -62,6 +64,8 @@ def sparse_random_uniform(
       dtype: Output data type (default: float32).
       minval: Minimum value (inclusive).
       maxval: Maximum value (exclusive).
+      seed: Optional batch-specific seeds for batch-invariant sampling.
+      positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
       Array of uniform random values with same shape as indices[0].
@@ -71,8 +75,23 @@ def sparse_random_uniform(
   if key_ref.ndim == 0:
     # Scalar JAX key - extract data and reshape
     key_ref = jnp.reshape(jax.random.key_data(key_ref), (1, 2))
-  counts_lo = indices[0] * dim1_size + indices[1]
-  counts_lo = counts_lo.astype(jnp.uint32)
+
+  # Compute counter for PRNG
+  if seed is not None and positions is not None:
+    # Batch-invariant sampling using prime number hashing
+    # Matches multinomial_with_seed in sampler.py
+    batch_idx = indices[0]
+    token_idx = indices[1]
+
+    # Hash: (seed * prime1 ^ position * prime2) * prime3 ^ token_idx * prime4
+    # Using same primes as sglang-jax: 19349663, 73856093, 805306457, 479001599
+    step_seed = (seed[batch_idx].astype(jnp.uint32) * jnp.uint32(19349663)) ^ (positions[batch_idx].astype(jnp.uint32) * jnp.uint32(73856093))
+    counts_lo = (step_seed * jnp.uint32(805306457)) ^ (token_idx.astype(jnp.uint32) * jnp.uint32(479001599))
+  else:
+    # Standard sampling (batch-dependent)
+    counts_lo = indices[0] * dim1_size + indices[1]
+    counts_lo = counts_lo.astype(jnp.uint32)
+
   counts_hi = jnp.zeros_like(counts_lo)
   k1 = jnp.reshape(key_ref[0, 0], (1, 1))
   k2 = jnp.reshape(key_ref[0, 1], (1, 1))
@@ -89,10 +108,12 @@ def sparse_random_uniform(
 
 
 def sparse_random_categorical(
-  key_ref, logits, indices, dim1_size, axis=-1, dtype=jnp.float32
+  key_ref, logits, indices, dim1_size, axis=-1, dtype=jnp.float32, seed=None, positions=None
 ):
   """
   Perform Gumbel-max sampling on sparse logits.
+
+  Supports batch-invariant sampling when seed and positions are provided.
 
   Args:
       key_ref: RNG key.
@@ -101,6 +122,8 @@ def sparse_random_categorical(
       dim1_size: Size of dimension 1 (for RNG seeding).
       axis: Axis along which to perform max reduction (default: -1).
       dtype: Dtype for computation (must be float32).
+      seed: Optional batch-specific seeds for batch-invariant sampling.
+      positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
       Sampled indices.
@@ -118,6 +141,8 @@ def sparse_random_categorical(
     dtype=jnp.float32,
     minval=jnp.finfo(jnp.float32).tiny,
     maxval=1.0,
+    seed=seed,
+    positions=positions,
   )
   # Compute Gumbel noise: -log(-log(u))
   gumbel = -jnp.log(-jnp.log(u))

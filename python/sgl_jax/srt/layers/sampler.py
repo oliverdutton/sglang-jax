@@ -58,7 +58,7 @@ class Sampler(nnx.Module):
             temperature=sampling_metadata.temperatures.flatten(),
         )
 
-        # Call Pallas sampling kernel
+        # Call Pallas sampling kernel with batch-invariant sampling support
         vocab_size = logits.shape[1]
         batch_next_token_ids = topk_topp_and_sample(
             rng,
@@ -67,6 +67,8 @@ class Sampler(nnx.Module):
             max_k=max_k,
             sampling_eps=1e-6,
             replace_val=-1e12,
+            seed=sampling_metadata.sampling_seeds,
+            positions=sampling_metadata.positions,
         )
 
         # Compute logprobs for return
