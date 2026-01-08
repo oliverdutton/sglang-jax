@@ -9,7 +9,7 @@ from sgl_jax.srt.kernels.sampling.divide_and_filter_topk import top_bounded_k
 
 
 @functools.partial(
-  jax.jit, static_argnames=("max_k", "num_bins", "bins_topm_schedule", "sampling_eps", "replace_val")
+  jax.jit, static_argnames=("max_k", "num_bins", "bins_topm_schedule", "sampling_eps", "replace_val", "filter_type")
 )
 def topk_topp_and_sample(
   rng_key,
@@ -20,6 +20,7 @@ def topk_topp_and_sample(
   bins_topm_schedule: int | None = None,
   sampling_eps: float = 1e-5,
   replace_val: float = -1e12,
+  filter_type: str = "sequential",
 ):
   """Combined top-k, top-p filtering, and sampling for vLLM inference.
 
@@ -32,20 +33,40 @@ def topk_topp_and_sample(
     bins_topm_schedule: Optional custom schedule for binned top-m computation.
     sampling_eps: Use greedy token if temperature < eps
     replace_val: Replace padding entries in probabilities with constant
+    filter_type: "sequential" (normalize across top-k only) or "joint" (normalize across full vocab)
 
   Returns:
     Sampled token indices.
   """
   vocab_size = logits.shape[1]
-  topk_logits, topk_idxs = top_bounded_k(
-    logits,
-    k=tpu_sampling_metadata.top_k,
-    replace_val=replace_val,
-    max_k=max_k,
-    num_bins=num_bins,
-    bins_topm_schedule=bins_topm_schedule,
-    guarantee_convergence=True,
-  )
+
+  # Compute unnormalised_probs_sum if using joint filtering
+  compute_unnorm = (filter_type == "joint")
+
+  if compute_unnorm:
+    topk_logits, topk_idxs, unnormalised_probs_sum = top_bounded_k(
+      logits,
+      k=tpu_sampling_metadata.top_k,
+      replace_val=replace_val,
+      max_k=max_k,
+      num_bins=num_bins,
+      bins_topm_schedule=bins_topm_schedule,
+      guarantee_convergence=True,
+      compute_unnormalised_probs_sum=True,
+    )
+  else:
+    topk_logits, topk_idxs = top_bounded_k(
+      logits,
+      k=tpu_sampling_metadata.top_k,
+      replace_val=replace_val,
+      max_k=max_k,
+      num_bins=num_bins,
+      bins_topm_schedule=bins_topm_schedule,
+      guarantee_convergence=True,
+      compute_unnormalised_probs_sum=False,
+    )
+    unnormalised_probs_sum = None
+
   if rng_key.shape == ():
     rng_key = jax.random.key_data(rng_key)
   return top_p_and_sample(
@@ -57,4 +78,5 @@ def topk_topp_and_sample(
     vocab_size=vocab_size,
     replace_val=replace_val,
     sampling_eps=sampling_eps,
+    unnormalised_probs_sum=unnormalised_probs_sum,
   )

@@ -331,7 +331,100 @@ def _merge_unconverged_bins_topk(
   )
 
 
+def dynamic_topk_refs_with_unnorm(
+  # Inputs
+  logits_ref,
+  k_smem_ref,
+  k_vmem_ref,
+  # Outputs
+  topk_vals_ref,
+  topk_idxs_ref,
+  unnormalised_probs_sum_ref,
+  valid_ref,
+  max_depth_ref,
+  cutoff_vals_ref,
+  # Scratch
+  bins_topm_vals_ref,
+  bins_topm_idxs_ref,
+  termination_flag_ref,
+  *,
+  max_k: int,
+  num_bins: int,
+  bins_topm_unroll: int,
+  bins_topm_schedule: tuple[int, ...],
+  guarantee_convergence: bool,
+  replace_val: float | int | None,
+):
+  """Version with unnormalised_probs_sum output."""
+  _dynamic_topk_refs_impl(
+    logits_ref=logits_ref,
+    k_smem_ref=k_smem_ref,
+    k_vmem_ref=k_vmem_ref,
+    topk_vals_ref=topk_vals_ref,
+    topk_idxs_ref=topk_idxs_ref,
+    valid_ref=valid_ref,
+    max_depth_ref=max_depth_ref,
+    cutoff_vals_ref=cutoff_vals_ref,
+    bins_topm_vals_ref=bins_topm_vals_ref,
+    bins_topm_idxs_ref=bins_topm_idxs_ref,
+    termination_flag_ref=termination_flag_ref,
+    unnormalised_probs_sum_ref=unnormalised_probs_sum_ref,
+    max_k=max_k,
+    num_bins=num_bins,
+    bins_topm_unroll=bins_topm_unroll,
+    bins_topm_schedule=bins_topm_schedule,
+    guarantee_convergence=guarantee_convergence,
+    replace_val=replace_val,
+  )
+
+
 def dynamic_topk_refs(
+  # Inputs
+  logits_ref,
+  k_smem_ref,
+  k_vmem_ref,
+  # Outputs
+  topk_vals_ref,
+  topk_idxs_ref,
+  valid_ref,
+  max_depth_ref,
+  cutoff_vals_ref,
+  # Scratch
+  bins_topm_vals_ref,
+  bins_topm_idxs_ref,
+  termination_flag_ref,
+  *,
+  max_k: int,
+  num_bins: int,
+  bins_topm_unroll: int,
+  bins_topm_schedule: tuple[int, ...],
+  guarantee_convergence: bool,
+  replace_val: float | int | None,
+):
+  """Version without unnormalised_probs_sum output."""
+  _dynamic_topk_refs_impl(
+    logits_ref=logits_ref,
+    k_smem_ref=k_smem_ref,
+    k_vmem_ref=k_vmem_ref,
+    topk_vals_ref=topk_vals_ref,
+    topk_idxs_ref=topk_idxs_ref,
+    valid_ref=valid_ref,
+    max_depth_ref=max_depth_ref,
+    cutoff_vals_ref=cutoff_vals_ref,
+    bins_topm_vals_ref=bins_topm_vals_ref,
+    bins_topm_idxs_ref=bins_topm_idxs_ref,
+    termination_flag_ref=termination_flag_ref,
+    unnormalised_probs_sum_ref=None,
+    max_k=max_k,
+    num_bins=num_bins,
+    bins_topm_unroll=bins_topm_unroll,
+    bins_topm_schedule=bins_topm_schedule,
+    guarantee_convergence=guarantee_convergence,
+    replace_val=replace_val,
+  )
+
+
+def _dynamic_topk_refs_impl(
   logits_ref,
   k_smem_ref,
   k_vmem_ref,
@@ -340,10 +433,10 @@ def dynamic_topk_refs(
   valid_ref,
   max_depth_ref,
   cutoff_vals_ref,
-  # scratch
   bins_topm_vals_ref,
   bins_topm_idxs_ref,
   termination_flag_ref,
+  unnormalised_probs_sum_ref,
   *,
   max_k: int,
   num_bins: int,
@@ -362,6 +455,7 @@ def dynamic_topk_refs(
   The termination criterion checks if the top-(m-1) bins collectively contain at least
   k values larger than the largest m-th largest value across all bins.
   """
+
   # Initialize buffers
   block_token = logits_ref.shape[0]
   shape = (block_token, bins_topm_vals_ref.shape[1])
@@ -448,6 +542,15 @@ def dynamic_topk_refs(
         # Record largest m-th largest value
         # Useful for bounds checking if running sharded topk
         cutoff_vals_ref[token_idx] = pivot.squeeze(1)[i]
+
+  # Compute unnormalised probs sum if requested
+  if unnormalised_probs_sum_ref is not None:
+    # Get max_val from first num_bins entries in bins_topm_vals
+    max_vals = bins_topm_vals_ref[token_slice, :num_bins].max(axis=1, keepdims=True)
+    # Compute exp(logits - max_vals).sum(1, keepdims=True)
+    unnormalised_probs_sum_ref[...] = jnp.exp(
+      logits_ref[...].astype(jnp.float32) - max_vals
+    ).sum(1, keepdims=True)
 
   # Bin packing optimization for non-convergence cases
   m_final = bins_topm_schedule[-1]
@@ -549,6 +652,7 @@ def dynamic_topk_refs(
     "guarantee_convergence",
     "replace_val",
     "interpret",
+    "compute_unnormalised_probs_sum",
   ),
 )
 def _top_bounded_k(
@@ -563,6 +667,7 @@ def _top_bounded_k(
   guarantee_convergence: bool = True,
   replace_val: float | int | None = None,
   interpret: bool = False,
+  compute_unnormalised_probs_sum: bool = False,
 ):
   """
   High-level interface for adaptive binned top-k computation on TPU.
@@ -675,21 +780,43 @@ def _top_bounded_k(
   max_m = bins_topm_schedule[-1]
   buffer_size = max_m * num_bins
 
-  output_shapes = (
+  # Conditional output shapes based on compute_unnormalised_probs_sum
+  base_output_shapes = [
     jax.ShapeDtypeStruct((num_tokens, max_k), logits.dtype),
     jax.ShapeDtypeStruct((num_tokens, max_k), jnp.int32),
+  ]
+
+  if compute_unnormalised_probs_sum:
+    base_output_shapes.append(
+      jax.ShapeDtypeStruct((num_tokens, 1), jnp.float32)
+    )
+
+  base_output_shapes.extend([
     jax.ShapeDtypeStruct((1,), jnp.int32),
     jax.ShapeDtypeStruct((num_tokens_padded,), jnp.int32),
     jax.ShapeDtypeStruct((num_tokens_padded,), to_32bit_dtype(logits.dtype)),
-  )
+  ])
 
-  output_specs = (
+  output_shapes = tuple(base_output_shapes)
+
+  # Conditional output specs
+  base_output_specs = [
     pl.BlockSpec((block_topk, max_k), lambda i: (i // topk_unroll, 0)),
     pl.BlockSpec((block_topk, max_k), lambda i: (i // topk_unroll, 0)),
+  ]
+
+  if compute_unnormalised_probs_sum:
+    base_output_specs.append(
+      pl.BlockSpec((block_token, 1), lambda i: (i, 0))
+    )
+
+  base_output_specs.extend([
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(memory_space=pltpu.SMEM),
-  )
+  ])
+
+  output_specs = tuple(base_output_specs)
 
   # Add scratch shapes
 
@@ -699,9 +826,11 @@ def _top_bounded_k(
     pltpu.SMEM((1,), jnp.int32),
   ]
 
+  kernel_fn = dynamic_topk_refs_with_unnorm if compute_unnormalised_probs_sum else dynamic_topk_refs
+
   outputs = pl.pallas_call(
     functools.partial(
-      dynamic_topk_refs,
+      kernel_fn,
       max_k=max_k,
       num_bins=num_bins,
       bins_topm_unroll=bins_topm_unroll,
@@ -722,7 +851,12 @@ def _top_bounded_k(
     compiler_params=pltpu.CompilerParams(vmem_limit_bytes=int(0.9 * 2**27)),
     interpret=interpret,
   )(logits, k, k[:, None])
-  topk_vals, topk_idxs, valid, depths, cutoff_vals = outputs
+
+  # Unpack outputs based on compute_unnormalised_probs_sum
+  if compute_unnormalised_probs_sum:
+    topk_vals, topk_idxs, unnormalised_probs_sum, valid, depths, cutoff_vals = outputs
+  else:
+    topk_vals, topk_idxs, valid, depths, cutoff_vals = outputs
 
   topk_vals, topk_idxs = (
     x[:num_tokens, :max_k] for x in (topk_vals, topk_idxs)
@@ -730,7 +864,19 @@ def _top_bounded_k(
   valid = valid.squeeze().astype(bool)
 
   if guarantee_convergence:
+    if compute_unnormalised_probs_sum:
+      return topk_vals, topk_idxs, unnormalised_probs_sum[:num_tokens]
     return topk_vals, topk_idxs
+
+  if compute_unnormalised_probs_sum:
+    return (
+      topk_vals,
+      topk_idxs,
+      unnormalised_probs_sum[:num_tokens],
+      valid,
+      depths[:num_tokens],
+      cutoff_vals[:num_tokens],
+    )
   return (
     topk_vals,
     topk_idxs,
@@ -752,6 +898,7 @@ def _top_bounded_k(
     "guarantee_convergence",
     "replace_val",
     "interpret",
+    "compute_unnormalised_probs_sum",
   ),
 )
 @functools.wraps(_top_bounded_k)
@@ -767,6 +914,7 @@ def top_bounded_k(
   guarantee_convergence: bool = False,
   replace_val: float | int | None = None,
   interpret: bool = False,
+  compute_unnormalised_probs_sum: bool = False,
 ):
   def _closed_topk(logits: jax.Array, k: jax.Array):
     return _top_bounded_k(
@@ -781,6 +929,7 @@ def top_bounded_k(
       guarantee_convergence=guarantee_convergence,
       replace_val=replace_val,
       interpret=interpret,
+      compute_unnormalised_probs_sum=compute_unnormalised_probs_sum,
     )
 
   @custom_partitioning
