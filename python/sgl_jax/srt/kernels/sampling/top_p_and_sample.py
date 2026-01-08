@@ -176,13 +176,15 @@ def top_p_and_sample_refs(
   top_p_ref,
   temperature_ref,
   dim0_offset_ref,
+  min_p_ref,
+  unnormalised_probs_sum_ref,
   sampled_tokens_ref,
   *,
   vocab_size: int,
   replace_val: float,
   sampling_eps: float,
-  min_p_ref=None,
-  unnormalised_probs_sum_ref=None,
+  has_min_p: bool,
+  has_unnormalised_probs_sum: bool,
 ):
   """
   Fused kernel implementing top-p filtering, min-p filtering, temperature scaling, and sampling.
@@ -194,12 +196,14 @@ def top_p_and_sample_refs(
       top_p_ref: Reference to top-p values
       temperature_ref: Reference to temperature values
       dim0_offset_ref: Reference to dim0 offset for sharding (SMEM, shape (1,))
+      min_p_ref: Reference to min-p values (may contain dummy data if has_min_p=False)
+      unnormalised_probs_sum_ref: Reference to unnormalised probability sum (may contain dummy data if has_unnormalised_probs_sum=False)
       sampled_tokens_ref: Reference to output sampled tokens
       vocab_size: Vocabulary size
       replace_val: Value to replace filtered logits with
       sampling_eps: if temperature below eps, greedy token is taken
-      min_p_ref: Reference to min-p values. Optional.
-      unnormalised_probs_sum_ref: Reference to unnormalised probability sum. Optional.
+      has_min_p: Whether to use min_p_ref
+      has_unnormalised_probs_sum: Whether to use unnormalised_probs_sum_ref
   """
   sampled_tokens_ref[...] = top_p_and_sample_arrays(
     topk_logits=topk_logits_ref[...],
@@ -210,9 +214,9 @@ def top_p_and_sample_refs(
     vocab_size=vocab_size,
     replace_val=replace_val,
     sampling_eps=sampling_eps,
-    min_p=min_p_ref[...] if min_p_ref is not None else None,
+    min_p=min_p_ref[...] if has_min_p else None,
     dim0_offset=dim0_offset_ref[0],  # Extract scalar from SMEM array
-    unnormalised_probs_sum=unnormalised_probs_sum_ref[...] if unnormalised_probs_sum_ref is not None else None,
+    unnormalised_probs_sum=unnormalised_probs_sum_ref[...] if has_unnormalised_probs_sum else None,
   )
 
 
@@ -252,30 +256,31 @@ def _top_p_and_sample(
   Returns:
       next_tokens: Sampled tokens of shape (batch_size,)
   """
-  in_specs = [
+  # Always include all in_specs and args; use dummy arrays for None parameters
+  # to maintain consistent pallas_call signature
+  min_p_arg = min_p if min_p is not None else jnp.zeros((1,), dtype=jnp.float32)
+  unnormalised_probs_sum_arg = unnormalised_probs_sum if unnormalised_probs_sum is not None else jnp.zeros((1, 1), dtype=jnp.float32)
+
+  in_specs = (
     pl.BlockSpec(),
     pl.BlockSpec(),
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(),
     pl.BlockSpec(),
     pl.BlockSpec(memory_space=pltpu.SMEM),
-  ]
-  args = [
+    pl.BlockSpec(),
+    pl.BlockSpec(),
+  )
+  args = (
     topk_logits,
     topk_idx,
     rng_key.reshape(1, 2),
     top_p,
     temperature,
     jnp.array(dim0_offset, jnp.int32)[None],
-  ]
-
-  if min_p is not None:
-    in_specs.append(pl.BlockSpec())
-    args.append(min_p)
-
-  if unnormalised_probs_sum is not None:
-    in_specs.append(pl.BlockSpec())
-    args.append(unnormalised_probs_sum)
+    min_p_arg,
+    unnormalised_probs_sum_arg,
+  )
 
   return pl.pallas_call(
     functools.partial(
@@ -283,10 +288,10 @@ def _top_p_and_sample(
       vocab_size=vocab_size,
       replace_val=replace_val,
       sampling_eps=sampling_eps,
-      min_p_ref=min_p,
-      unnormalised_probs_sum_ref=unnormalised_probs_sum,
+      has_min_p=(min_p is not None),
+      has_unnormalised_probs_sum=(unnormalised_probs_sum is not None),
     ),
-    in_specs=tuple(in_specs),
+    in_specs=in_specs,
     out_shape=jax.ShapeDtypeStruct(topk_logits.shape[:1], jnp.int32),
     interpret=interpret,
   )(*args)
@@ -388,13 +393,11 @@ def top_p_and_sample(
 
     return mesh, shmap_fn, out_shardings, arg_shardings
 
-  # Determine sharding rule based on optional parameters
-  rule_parts = ["b k", "b k", "r", "b", "b"]
-  if min_p is not None:
-    rule_parts.append("b")
-  if unnormalised_probs_sum is not None:
-    rule_parts.append("b 1")
-  sharding_rule = ", ".join(rule_parts) + " -> b"
+  # Always include all parameters in sharding rule; use dummy arrays for None values
+  min_p_arg = min_p if min_p is not None else jnp.zeros((1,), dtype=jnp.float32)
+  unnormalised_probs_sum_arg = unnormalised_probs_sum if unnormalised_probs_sum is not None else jnp.zeros((1, 1), dtype=jnp.float32)
+
+  sharding_rule = "b k, b k, r, b, b, b, b 1 -> b"
 
   sharded_top_p_and_sample.def_partition(
     infer_sharding_from_operands=infer_sharding_from_operands,
@@ -404,5 +407,5 @@ def top_p_and_sample(
   )
 
   return sharded_top_p_and_sample(
-    topk_logits, topk_idx, rng_key, top_p, temperature, min_p, unnormalised_probs_sum
+    topk_logits, topk_idx, rng_key, top_p, temperature, min_p_arg, unnormalised_probs_sum_arg
   )

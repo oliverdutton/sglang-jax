@@ -331,53 +331,6 @@ def _merge_unconverged_bins_topk(
   )
 
 
-def dynamic_topk_refs_with_unnorm(
-  # Inputs
-  logits_ref,
-  k_smem_ref,
-  k_vmem_ref,
-  # Outputs
-  topk_vals_ref,
-  topk_idxs_ref,
-  unnormalised_probs_sum_ref,
-  valid_ref,
-  max_depth_ref,
-  cutoff_vals_ref,
-  # Scratch
-  bins_topm_vals_ref,
-  bins_topm_idxs_ref,
-  termination_flag_ref,
-  *,
-  max_k: int,
-  num_bins: int,
-  bins_topm_unroll: int,
-  bins_topm_schedule: tuple[int, ...],
-  guarantee_convergence: bool,
-  replace_val: float | int | None,
-):
-  """Version with unnormalised_probs_sum output."""
-  _dynamic_topk_refs_impl(
-    logits_ref=logits_ref,
-    k_smem_ref=k_smem_ref,
-    k_vmem_ref=k_vmem_ref,
-    topk_vals_ref=topk_vals_ref,
-    topk_idxs_ref=topk_idxs_ref,
-    valid_ref=valid_ref,
-    max_depth_ref=max_depth_ref,
-    cutoff_vals_ref=cutoff_vals_ref,
-    bins_topm_vals_ref=bins_topm_vals_ref,
-    bins_topm_idxs_ref=bins_topm_idxs_ref,
-    termination_flag_ref=termination_flag_ref,
-    unnormalised_probs_sum_ref=unnormalised_probs_sum_ref,
-    max_k=max_k,
-    num_bins=num_bins,
-    bins_topm_unroll=bins_topm_unroll,
-    bins_topm_schedule=bins_topm_schedule,
-    guarantee_convergence=guarantee_convergence,
-    replace_val=replace_val,
-  )
-
-
 def dynamic_topk_refs(
   # Inputs
   logits_ref,
@@ -386,6 +339,7 @@ def dynamic_topk_refs(
   # Outputs
   topk_vals_ref,
   topk_idxs_ref,
+  unnormalised_probs_sum_ref,
   valid_ref,
   max_depth_ref,
   cutoff_vals_ref,
@@ -393,50 +347,6 @@ def dynamic_topk_refs(
   bins_topm_vals_ref,
   bins_topm_idxs_ref,
   termination_flag_ref,
-  *,
-  max_k: int,
-  num_bins: int,
-  bins_topm_unroll: int,
-  bins_topm_schedule: tuple[int, ...],
-  guarantee_convergence: bool,
-  replace_val: float | int | None,
-):
-  """Version without unnormalised_probs_sum output."""
-  _dynamic_topk_refs_impl(
-    logits_ref=logits_ref,
-    k_smem_ref=k_smem_ref,
-    k_vmem_ref=k_vmem_ref,
-    topk_vals_ref=topk_vals_ref,
-    topk_idxs_ref=topk_idxs_ref,
-    valid_ref=valid_ref,
-    max_depth_ref=max_depth_ref,
-    cutoff_vals_ref=cutoff_vals_ref,
-    bins_topm_vals_ref=bins_topm_vals_ref,
-    bins_topm_idxs_ref=bins_topm_idxs_ref,
-    termination_flag_ref=termination_flag_ref,
-    unnormalised_probs_sum_ref=None,
-    max_k=max_k,
-    num_bins=num_bins,
-    bins_topm_unroll=bins_topm_unroll,
-    bins_topm_schedule=bins_topm_schedule,
-    guarantee_convergence=guarantee_convergence,
-    replace_val=replace_val,
-  )
-
-
-def _dynamic_topk_refs_impl(
-  logits_ref,
-  k_smem_ref,
-  k_vmem_ref,
-  topk_vals_ref,
-  topk_idxs_ref,
-  valid_ref,
-  max_depth_ref,
-  cutoff_vals_ref,
-  bins_topm_vals_ref,
-  bins_topm_idxs_ref,
-  termination_flag_ref,
-  unnormalised_probs_sum_ref,
   *,
   max_k: int,
   num_bins: int,
@@ -454,6 +364,10 @@ def _dynamic_topk_refs_impl(
 
   The termination criterion checks if the top-(m-1) bins collectively contain at least
   k values larger than the largest m-th largest value across all bins.
+
+  Args:
+      unnormalised_probs_sum_ref: Optional ref for unnormalised probability sum.
+          If None, computation is skipped.
   """
 
   # Initialize buffers
@@ -780,43 +694,24 @@ def _top_bounded_k(
   max_m = bins_topm_schedule[-1]
   buffer_size = max_m * num_bins
 
-  # Conditional output shapes based on compute_unnormalised_probs_sum
-  base_output_shapes = [
+  # Always include all output shapes and specs
+  output_shapes = (
     jax.ShapeDtypeStruct((num_tokens, max_k), logits.dtype),
     jax.ShapeDtypeStruct((num_tokens, max_k), jnp.int32),
-  ]
-
-  if compute_unnormalised_probs_sum:
-    base_output_shapes.append(
-      jax.ShapeDtypeStruct((num_tokens, 1), jnp.float32)
-    )
-
-  base_output_shapes.extend([
+    jax.ShapeDtypeStruct((num_tokens, 1), jnp.float32),
     jax.ShapeDtypeStruct((1,), jnp.int32),
     jax.ShapeDtypeStruct((num_tokens_padded,), jnp.int32),
     jax.ShapeDtypeStruct((num_tokens_padded,), to_32bit_dtype(logits.dtype)),
-  ])
+  )
 
-  output_shapes = tuple(base_output_shapes)
-
-  # Conditional output specs
-  base_output_specs = [
+  output_specs = (
     pl.BlockSpec((block_topk, max_k), lambda i: (i // topk_unroll, 0)),
     pl.BlockSpec((block_topk, max_k), lambda i: (i // topk_unroll, 0)),
-  ]
-
-  if compute_unnormalised_probs_sum:
-    base_output_specs.append(
-      pl.BlockSpec((block_token, 1), lambda i: (i, 0))
-    )
-
-  base_output_specs.extend([
+    pl.BlockSpec((block_token, 1), lambda i: (i, 0)),
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(memory_space=pltpu.SMEM),
-  ])
-
-  output_specs = tuple(base_output_specs)
+  )
 
   # Add scratch shapes
 
@@ -826,11 +721,10 @@ def _top_bounded_k(
     pltpu.SMEM((1,), jnp.int32),
   ]
 
-  kernel_fn = dynamic_topk_refs_with_unnorm if compute_unnormalised_probs_sum else dynamic_topk_refs
-
+  # Always use the same kernel function
   outputs = pl.pallas_call(
     functools.partial(
-      kernel_fn,
+      dynamic_topk_refs,
       max_k=max_k,
       num_bins=num_bins,
       bins_topm_unroll=bins_topm_unroll,
@@ -852,34 +746,27 @@ def _top_bounded_k(
     interpret=interpret,
   )(logits, k, k[:, None])
 
-  # Unpack outputs based on compute_unnormalised_probs_sum
-  if compute_unnormalised_probs_sum:
-    topk_vals, topk_idxs, unnormalised_probs_sum, valid, depths, cutoff_vals = outputs
-  else:
-    topk_vals, topk_idxs, valid, depths, cutoff_vals = outputs
+  # Always unpack all outputs
+  topk_vals, topk_idxs, unnormalised_probs_sum, valid, depths, cutoff_vals = outputs
 
   topk_vals, topk_idxs = (
     x[:num_tokens, :max_k] for x in (topk_vals, topk_idxs)
   )
   valid = valid.squeeze().astype(bool)
 
-  if guarantee_convergence:
-    if compute_unnormalised_probs_sum:
-      return topk_vals, topk_idxs, unnormalised_probs_sum[:num_tokens]
-    return topk_vals, topk_idxs
+  # Set unnormalised_probs_sum to None if not requested
+  if not compute_unnormalised_probs_sum:
+    unnormalised_probs_sum = None
+  else:
+    unnormalised_probs_sum = unnormalised_probs_sum[:num_tokens]
 
-  if compute_unnormalised_probs_sum:
-    return (
-      topk_vals,
-      topk_idxs,
-      unnormalised_probs_sum[:num_tokens],
-      valid,
-      depths[:num_tokens],
-      cutoff_vals[:num_tokens],
-    )
+  if guarantee_convergence:
+    return topk_vals, topk_idxs, unnormalised_probs_sum
+
   return (
     topk_vals,
     topk_idxs,
+    unnormalised_probs_sum,
     valid,
     depths[:num_tokens],
     cutoff_vals[:num_tokens],
@@ -938,7 +825,11 @@ def top_bounded_k(
 
   def infer_sharding_from_operands(mesh, arg_shapes, result_shape):
     logits_spec = arg_shapes[0].sharding.spec
-    return (NamedSharding(mesh, P(logits_spec[0], None)),) * 2
+    base_shardings = (NamedSharding(mesh, P(logits_spec[0], None)),) * 2
+    if compute_unnormalised_probs_sum:
+      # Add sharding for unnormalised_probs_sum: (batch, 1)
+      base_shardings += (NamedSharding(mesh, P(logits_spec[0], None)),)
+    return base_shardings
 
   def partition(mesh, arg_shapes, out_shapes):
     if not guarantee_convergence:
@@ -949,9 +840,10 @@ def top_bounded_k(
     axis_name = arg_shardings[0].spec[1]
 
     def shmap_fn(logits, k):
-      topk_logits, topk_idxs = _closed_topk(logits, k)
+      result = _closed_topk(logits, k)
+      topk_logits, topk_idxs, unnormalised_probs_sum = result
       if axis_name is None:
-        return topk_logits, topk_idxs
+        return result
       # convert idxs to global frame
       i = jax.lax.axis_index(axis_name)
       topk_idxs += i * logits.shape[1]
@@ -966,14 +858,18 @@ def top_bounded_k(
         topk_logits,
         replace_val,
       )
-      return topk_logits, topk_idxs
+      return topk_logits, topk_idxs, unnormalised_probs_sum
 
     return mesh, shmap_fn, out_shardings, arg_shardings
+
+  sharding_rule = "b v, b -> b k, b k"
+  if compute_unnormalised_probs_sum:
+    sharding_rule += ", b 1"
 
   _sharded_topk.def_partition(
     infer_sharding_from_operands=infer_sharding_from_operands,
     partition=partition,
-    sharding_rule="b v, b -> b k, b k",
+    sharding_rule=sharding_rule,
   )
   return _sharded_topk(logits, k)
 

@@ -43,29 +43,17 @@ def topk_topp_and_sample(
   # Compute unnormalised_probs_sum if using joint filtering
   compute_unnorm = (filter_type == "joint")
 
-  if compute_unnorm:
-    topk_logits, topk_idxs, unnormalised_probs_sum = top_bounded_k(
-      logits,
-      k=tpu_sampling_metadata.top_k,
-      replace_val=replace_val,
-      max_k=max_k,
-      num_bins=num_bins,
-      bins_topm_schedule=bins_topm_schedule,
-      guarantee_convergence=True,
-      compute_unnormalised_probs_sum=True,
-    )
-  else:
-    topk_logits, topk_idxs = top_bounded_k(
-      logits,
-      k=tpu_sampling_metadata.top_k,
-      replace_val=replace_val,
-      max_k=max_k,
-      num_bins=num_bins,
-      bins_topm_schedule=bins_topm_schedule,
-      guarantee_convergence=True,
-      compute_unnormalised_probs_sum=False,
-    )
-    unnormalised_probs_sum = None
+  # Always unpack 3 values; unnormalised_probs_sum will be None if not computed
+  topk_logits, topk_idxs, unnormalised_probs_sum = top_bounded_k(
+    logits,
+    k=tpu_sampling_metadata.top_k,
+    replace_val=replace_val,
+    max_k=max_k,
+    num_bins=num_bins,
+    bins_topm_schedule=bins_topm_schedule,
+    guarantee_convergence=True,
+    compute_unnormalised_probs_sum=compute_unnorm,
+  )
 
   if rng_key.shape == ():
     rng_key = jax.random.key_data(rng_key)
