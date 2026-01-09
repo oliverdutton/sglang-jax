@@ -339,7 +339,6 @@ def dynamic_topk_refs(
   # Outputs
   topk_vals_ref,
   topk_idxs_ref,
-  unnormalised_probs_sum_ref,
   valid_ref,
   max_depth_ref,
   cutoff_vals_ref,
@@ -364,10 +363,6 @@ def dynamic_topk_refs(
 
   The termination criterion checks if the top-(m-1) bins collectively contain at least
   k values larger than the largest m-th largest value across all bins.
-
-  Args:
-      unnormalised_probs_sum_ref: Optional ref for unnormalised probability sum.
-          If None, computation is skipped.
   """
 
   # Initialize buffers
@@ -456,15 +451,6 @@ def dynamic_topk_refs(
         # Record largest m-th largest value
         # Useful for bounds checking if running sharded topk
         cutoff_vals_ref[token_idx] = pivot.squeeze(1)[i]
-
-  # Compute unnormalised probs sum if requested
-  if unnormalised_probs_sum_ref is not None:
-    # Get max_val from first num_bins entries in bins_topm_vals
-    max_vals = bins_topm_vals_ref[token_slice, :num_bins].max(axis=1, keepdims=True)
-    # Compute exp(logits - max_vals).sum(1, keepdims=True)
-    unnormalised_probs_sum_ref[...] = jnp.exp(
-      logits_ref[...].astype(jnp.float32) - max_vals
-    ).sum(1, keepdims=True)
 
   # Bin packing optimization for non-convergence cases
   m_final = bins_topm_schedule[-1]
@@ -566,7 +552,6 @@ def dynamic_topk_refs(
     "guarantee_convergence",
     "replace_val",
     "interpret",
-    "compute_unnormalised_probs_sum",
   ),
 )
 def _top_bounded_k(
@@ -581,7 +566,6 @@ def _top_bounded_k(
   guarantee_convergence: bool = True,
   replace_val: float | int | None = None,
   interpret: bool = False,
-  compute_unnormalised_probs_sum: bool = False,
 ):
   """
   High-level interface for adaptive binned top-k computation on TPU.
@@ -694,11 +678,9 @@ def _top_bounded_k(
   max_m = bins_topm_schedule[-1]
   buffer_size = max_m * num_bins
 
-  # Always include all output shapes and specs
   output_shapes = (
     jax.ShapeDtypeStruct((num_tokens, max_k), logits.dtype),
     jax.ShapeDtypeStruct((num_tokens, max_k), jnp.int32),
-    jax.ShapeDtypeStruct((num_tokens, 1), jnp.float32),
     jax.ShapeDtypeStruct((1,), jnp.int32),
     jax.ShapeDtypeStruct((num_tokens_padded,), jnp.int32),
     jax.ShapeDtypeStruct((num_tokens_padded,), to_32bit_dtype(logits.dtype)),
@@ -707,7 +689,6 @@ def _top_bounded_k(
   output_specs = (
     pl.BlockSpec((block_topk, max_k), lambda i: (i // topk_unroll, 0)),
     pl.BlockSpec((block_topk, max_k), lambda i: (i // topk_unroll, 0)),
-    pl.BlockSpec((block_token, 1), lambda i: (i, 0)),
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(memory_space=pltpu.SMEM),
     pl.BlockSpec(memory_space=pltpu.SMEM),
@@ -746,27 +727,19 @@ def _top_bounded_k(
     interpret=interpret,
   )(logits, k, k[:, None])
 
-  # Always unpack all outputs
-  topk_vals, topk_idxs, unnormalised_probs_sum, valid, depths, cutoff_vals = outputs
+  topk_vals, topk_idxs, valid, depths, cutoff_vals = outputs
 
   topk_vals, topk_idxs = (
     x[:num_tokens, :max_k] for x in (topk_vals, topk_idxs)
   )
   valid = valid.squeeze().astype(bool)
 
-  # Set unnormalised_probs_sum to None if not requested
-  if not compute_unnormalised_probs_sum:
-    unnormalised_probs_sum = None
-  else:
-    unnormalised_probs_sum = unnormalised_probs_sum[:num_tokens]
-
   if guarantee_convergence:
-    return topk_vals, topk_idxs, unnormalised_probs_sum
+    return topk_vals, topk_idxs
 
   return (
     topk_vals,
     topk_idxs,
-    unnormalised_probs_sum,
     valid,
     depths[:num_tokens],
     cutoff_vals[:num_tokens],
@@ -785,7 +758,6 @@ def _top_bounded_k(
     "guarantee_convergence",
     "replace_val",
     "interpret",
-    "compute_unnormalised_probs_sum",
   ),
 )
 @functools.wraps(_top_bounded_k)
@@ -801,7 +773,6 @@ def top_bounded_k(
   guarantee_convergence: bool = False,
   replace_val: float | int | None = None,
   interpret: bool = False,
-  compute_unnormalised_probs_sum: bool = False,
 ):
   def _closed_topk(logits: jax.Array, k: jax.Array):
     return _top_bounded_k(
@@ -816,7 +787,6 @@ def top_bounded_k(
       guarantee_convergence=guarantee_convergence,
       replace_val=replace_val,
       interpret=interpret,
-      compute_unnormalised_probs_sum=compute_unnormalised_probs_sum,
     )
 
   @custom_partitioning
@@ -825,11 +795,7 @@ def top_bounded_k(
 
   def infer_sharding_from_operands(mesh, arg_shapes, result_shape):
     logits_spec = arg_shapes[0].sharding.spec
-    base_shardings = (NamedSharding(mesh, P(logits_spec[0], None)),) * 2
-    if compute_unnormalised_probs_sum:
-      # Add sharding for unnormalised_probs_sum: (batch, 1)
-      base_shardings += (NamedSharding(mesh, P(logits_spec[0], None)),)
-    return base_shardings
+    return (NamedSharding(mesh, P(logits_spec[0], None)),) * 2
 
   def partition(mesh, arg_shapes, out_shapes):
     if not guarantee_convergence:
@@ -840,10 +806,9 @@ def top_bounded_k(
     axis_name = arg_shardings[0].spec[1]
 
     def shmap_fn(logits, k):
-      result = _closed_topk(logits, k)
-      topk_logits, topk_idxs, unnormalised_probs_sum = result
+      topk_logits, topk_idxs = _closed_topk(logits, k)
       if axis_name is None:
-        return result
+        return topk_logits, topk_idxs
       # convert idxs to global frame
       i = jax.lax.axis_index(axis_name)
       topk_idxs += i * logits.shape[1]
@@ -858,18 +823,14 @@ def top_bounded_k(
         topk_logits,
         replace_val,
       )
-      return topk_logits, topk_idxs, unnormalised_probs_sum
+      return topk_logits, topk_idxs
 
     return mesh, shmap_fn, out_shardings, arg_shardings
-
-  sharding_rule = "b v, b -> b k, b k"
-  if compute_unnormalised_probs_sum:
-    sharding_rule += ", b 1"
 
   _sharded_topk.def_partition(
     infer_sharding_from_operands=infer_sharding_from_operands,
     partition=partition,
-    sharding_rule=sharding_rule,
+    sharding_rule="b v, b -> b k, b k",
   )
   return _sharded_topk(logits, k)
 

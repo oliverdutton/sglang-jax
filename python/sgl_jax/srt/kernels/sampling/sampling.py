@@ -9,7 +9,7 @@ from sgl_jax.srt.kernels.sampling.divide_and_filter_topk import top_bounded_k
 
 
 @functools.partial(
-  jax.jit, static_argnames=("max_k", "num_bins", "bins_topm_schedule", "sampling_eps", "replace_val", "filter_type")
+  jax.jit, static_argnames=("max_k", "num_bins", "bins_topm_schedule", "sampling_eps", "replace_val")
 )
 def topk_topp_and_sample(
   rng_key,
@@ -20,7 +20,6 @@ def topk_topp_and_sample(
   bins_topm_schedule: int | None = None,
   sampling_eps: float = 1e-5,
   replace_val: float = -1e12,
-  filter_type: str = "sequential",
   seed=None,
   positions=None,
 ):
@@ -37,7 +36,6 @@ def topk_topp_and_sample(
     bins_topm_schedule: Optional custom schedule for binned top-m computation.
     sampling_eps: Use greedy token if temperature < eps
     replace_val: Replace padding entries in probabilities with constant
-    filter_type: "sequential" (normalize across top-k only) or "joint" (normalize across full vocab)
     seed: Optional batch-specific seeds for batch-invariant sampling.
     positions: Optional sequence positions for batch-invariant sampling.
 
@@ -46,11 +44,7 @@ def topk_topp_and_sample(
   """
   vocab_size = logits.shape[1]
 
-  # Compute unnormalised_probs_sum if using joint filtering
-  compute_unnorm = (filter_type == "joint")
-
-  # Always unpack 3 values; unnormalised_probs_sum will be None if not computed
-  topk_logits, topk_idxs, unnormalised_probs_sum = top_bounded_k(
+  topk_logits, topk_idxs = top_bounded_k(
     logits,
     k=tpu_sampling_metadata.top_k,
     replace_val=replace_val,
@@ -58,7 +52,6 @@ def topk_topp_and_sample(
     num_bins=num_bins,
     bins_topm_schedule=bins_topm_schedule,
     guarantee_convergence=True,
-    compute_unnormalised_probs_sum=compute_unnorm,
   )
 
   if rng_key.shape == ():
@@ -72,7 +65,6 @@ def topk_topp_and_sample(
     vocab_size=vocab_size,
     replace_val=replace_val,
     sampling_eps=sampling_eps,
-    unnormalised_probs_sum=unnormalised_probs_sum,
     seed=seed,
     positions=positions,
   )

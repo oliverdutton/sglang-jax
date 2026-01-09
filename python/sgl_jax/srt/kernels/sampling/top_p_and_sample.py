@@ -35,7 +35,7 @@ def broadcast_to(x, shape):
   return jnp.broadcast_to(x, shape)
 
 
-def top_p_mask(*, topk_logits, p, replace_val, axis, no_pallas_code=False, unnormalised_probs_sum=None):
+def top_p_mask(*, topk_logits, p, replace_val, axis, no_pallas_code=False):
   """
   Apply top-p filtering mask to sorted logits.
 
@@ -44,7 +44,6 @@ def top_p_mask(*, topk_logits, p, replace_val, axis, no_pallas_code=False, unnor
       p: Top-p threshold(s)
       replace_val: Value to replace filtered logits with
       axis: Axis along which to apply filtering (must be 0)
-      unnormalised_probs_sum: Optional unnormalised probability sum for joint normalization
 
   Returns:
       Masked logits with values outside top-p set to replace_val
@@ -57,14 +56,7 @@ def top_p_mask(*, topk_logits, p, replace_val, axis, no_pallas_code=False, unnor
   # Compute softmax probabilities
   # For numerical stability, subtract max (pre-sorted so its the first element)
   exp_logits = jnp.exp(topk_logits - topk_logits[:1, :])
-
-  # If unnormalised_probs_sum provided (joint filter), use it for normalization
-  if unnormalised_probs_sum is not None:
-    # unnormalised_probs_sum shape: (batch_size, 1), need to transpose for axis=0
-    probs = exp_logits / unnormalised_probs_sum.T
-  else:
-    # Sequential filter: normalize across only top-k
-    probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
+  probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
 
   # Top-p filtering using cumsum on sorted probabilities
   cumsum_probs = cumsum_arrays(probs, axis=0)
@@ -99,8 +91,7 @@ def top_p_and_sample_arrays(
   sampling_eps,
   min_p=None,
   dim0_offset: int = 0,
-  unnormalised_probs_sum=None,
-  seeds=None,
+  seed=None,
   positions=None,
 ):
   """
@@ -117,8 +108,7 @@ def top_p_and_sample_arrays(
       sampling_eps: if temperature below eps, greedy token is taken
       min_p: Minimum probability threshold values, shape (batch_size,). Optional.
       dim0_offset: Offset for dim0 (batch) axis, used for sharding (default: 0)
-      unnormalised_probs_sum: Unnormalised probability sum for joint filtering, shape (batch_size, 1). Optional.
-      seeds: Optional batch-specific seeds for batch-invariant sampling.
+      seed: Optional batch-specific seeds for batch-invariant sampling.
       positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
@@ -141,12 +131,11 @@ def top_p_and_sample_arrays(
     p=top_p,
     replace_val=replace_val,
     axis=0,
-    unnormalised_probs_sum=unnormalised_probs_sum,
   )
 
   # Compute probabilities with stable softmax
   exp_logits = jnp.exp(topk_logits - topk_logits[:1])
-  topk_probs = exp_logits / exp_logits.sum(axis=0, =True)
+  topk_probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
     
   # Apply min_p filtering if specified
   if min_p is not None:
@@ -163,10 +152,10 @@ def top_p_and_sample_arrays(
     topk_probs /= topk_probs.sum(axis=0, keepdims=True)
 
   # Sample from filtered logits
-  if seeds is not None and positions is not None:
+  if seed is not None and positions is not None:
     # Batch-invariant sampling using prime number hashing
     next_tokens = batch_invariant_sparse_categorical(
-      topk_probs, topk_idx, seeds, positions
+      topk_probs, topk_idx, seed, positions
     )
   else:
     # Standard sampling (batch-dependent)
@@ -196,7 +185,6 @@ def top_p_and_sample_refs(
   temperature_ref,
   dim0_offset_ref,
   min_p_ref,
-  unnormalised_probs_sum_ref,
   seed_ref,
   positions_ref,
   sampled_tokens_ref,
@@ -205,7 +193,6 @@ def top_p_and_sample_refs(
   replace_val: float,
   sampling_eps: float,
   has_min_p: bool,
-  has_unnormalised_probs_sum: bool,
   has_seed: bool,
   has_positions: bool,
 ):
@@ -220,7 +207,6 @@ def top_p_and_sample_refs(
       temperature_ref: Reference to temperature values
       dim0_offset_ref: Reference to dim0 offset for sharding (SMEM, shape (1,))
       min_p_ref: Reference to min-p values (may contain dummy data if has_min_p=False)
-      unnormalised_probs_sum_ref: Reference to unnormalised probability sum (may contain dummy data if has_unnormalised_probs_sum=False)
       seed_ref: Reference to batch-specific seeds (may contain dummy data if has_seed=False)
       positions_ref: Reference to sequence positions (may contain dummy data if has_positions=False)
       sampled_tokens_ref: Reference to output sampled tokens
@@ -228,7 +214,6 @@ def top_p_and_sample_refs(
       replace_val: Value to replace filtered logits with
       sampling_eps: if temperature below eps, greedy token is taken
       has_min_p: Whether to use min_p_ref
-      has_unnormalised_probs_sum: Whether to use unnormalised_probs_sum_ref
       has_seed: Whether to use seed_ref
       has_positions: Whether to use positions_ref
   """
@@ -243,7 +228,6 @@ def top_p_and_sample_refs(
     sampling_eps=sampling_eps,
     min_p=min_p_ref[...] if has_min_p else None,
     dim0_offset=dim0_offset_ref[0],  # Extract scalar from SMEM array
-    unnormalised_probs_sum=unnormalised_probs_sum_ref[...] if has_unnormalised_probs_sum else None,
     seed=seed_ref[...] if has_seed else None,
     positions=positions_ref[...] if has_positions else None,
   )
@@ -260,7 +244,6 @@ def _top_p_and_sample(
   replace_val: float,
   sampling_eps: float,
   min_p: jax.Array | None = None,
-  unnormalised_probs_sum: jax.Array | None = None,
   seed: jax.Array | None = None,
   positions: jax.Array | None = None,
   interpret: bool = False,
@@ -281,7 +264,6 @@ def _top_p_and_sample(
       replace_val: Value to replace filtered logits with
       sampling_eps: if temperature below eps, greedy token is taken
       min_p: Minimum probability threshold values, scalar or shape (batch_size,). Optional.
-      unnormalised_probs_sum: Unnormalised probability sum for joint filtering. Optional.
       seed: Optional batch-specific seeds for batch-invariant sampling.
       positions: Optional sequence positions for batch-invariant sampling.
       interpret: If True, run in CPU interpret mode (default: False)
@@ -295,7 +277,6 @@ def _top_p_and_sample(
   # to maintain consistent pallas_call signature
   batch_size = topk_logits.shape[0]
   min_p_arg = min_p if min_p is not None else jnp.zeros((1,), dtype=jnp.float32)
-  unnormalised_probs_sum_arg = unnormalised_probs_sum if unnormalised_probs_sum is not None else jnp.zeros((1, 1), dtype=jnp.float32)
   seed_arg = seed if seed is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
   positions_arg = positions if positions is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
 
@@ -309,7 +290,6 @@ def _top_p_and_sample(
     pl.BlockSpec(),
     pl.BlockSpec(),
     pl.BlockSpec(),
-    pl.BlockSpec(),
   )
   args = (
     topk_logits,
@@ -319,7 +299,6 @@ def _top_p_and_sample(
     temperature,
     jnp.array(dim0_offset, jnp.int32)[None],
     min_p_arg,
-    unnormalised_probs_sum_arg,
     seed_arg,
     positions_arg,
   )
@@ -331,7 +310,6 @@ def _top_p_and_sample(
       replace_val=replace_val,
       sampling_eps=sampling_eps,
       has_min_p=(min_p is not None),
-      has_unnormalised_probs_sum=(unnormalised_probs_sum is not None),
       has_seed=(seed is not None),
       has_positions=(positions is not None),
     ),
@@ -361,7 +339,6 @@ def top_p_and_sample(
   replace_val: float,
   sampling_eps: float,
   min_p: jax.Array | None = None,
-  unnormalised_probs_sum: jax.Array | None = None,
   seed: jax.Array | None = None,
   positions: jax.Array | None = None,
   interpret: bool = False,
@@ -383,7 +360,6 @@ def top_p_and_sample(
       replace_val: Value to replace filtered logits with.
       sampling_eps: if temperature below eps, greedy token is taken
       min_p: Minimum probability threshold values. Optional.
-      unnormalised_probs_sum: Unnormalised probability sum for joint filtering. Optional.
       seed: Optional batch-specific seeds for batch-invariant sampling.
       positions: Optional sequence positions for batch-invariant sampling.
       interpret: If True, run in CPU interpret mode (default: False).
@@ -394,7 +370,7 @@ def top_p_and_sample(
 
   @custom_partitioning
   def sharded_top_p_and_sample(
-    topk_logits, topk_idx, rng_key, top_p, temperature, min_p, unnormalised_probs_sum, seed, positions
+    topk_logits, topk_idx, rng_key, top_p, temperature, min_p, seed, positions
   ):
     return _top_p_and_sample(
       topk_logits,
@@ -406,7 +382,6 @@ def top_p_and_sample(
       replace_val=replace_val,
       sampling_eps=sampling_eps,
       min_p=min_p,
-      unnormalised_probs_sum=unnormalised_probs_sum,
       seed=seed,
       positions=positions,
       interpret=interpret,
@@ -423,7 +398,7 @@ def top_p_and_sample(
     )
     batch_axis_name = arg_shardings[0].spec[0]
 
-    def shmap_fn(topk_logits, topk_idx, rng_key, top_p, temperature, min_p, unnormalised_probs_sum, seed, positions):
+    def shmap_fn(topk_logits, topk_idx, rng_key, top_p, temperature, min_p, seed, positions):
       # Pass global sharded axis offset to maintain jax.random.categorical sampled values
       dim0_offset = 0
       if batch_axis_name is not None:
@@ -438,7 +413,6 @@ def top_p_and_sample(
         replace_val=replace_val,
         sampling_eps=sampling_eps,
         min_p=min_p,
-        unnormalised_probs_sum=unnormalised_probs_sum,
         seed=seed,
         positions=positions,
         interpret=interpret,
@@ -450,11 +424,10 @@ def top_p_and_sample(
   # Always include all parameters in sharding rule; use dummy arrays for None values
   batch_size = topk_logits.shape[0]
   min_p_arg = min_p if min_p is not None else jnp.zeros((1,), dtype=jnp.float32)
-  unnormalised_probs_sum_arg = unnormalised_probs_sum if unnormalised_probs_sum is not None else jnp.zeros((1, 1), dtype=jnp.float32)
   seed_arg = seed if seed is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
   positions_arg = positions if positions is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
 
-  sharding_rule = "b k, b k, r, b, b, b, b 1, b, b -> b"
+  sharding_rule = "b k, b k, r, b, b, b, b, b -> b"
 
   sharded_top_p_and_sample.def_partition(
     infer_sharding_from_operands=infer_sharding_from_operands,
@@ -464,5 +437,5 @@ def top_p_and_sample(
   )
 
   return sharded_top_p_and_sample(
-    topk_logits, topk_idx, rng_key, top_p, temperature, min_p_arg, unnormalised_probs_sum_arg, seed_arg, positions_arg
+    topk_logits, topk_idx, rng_key, top_p, temperature, min_p_arg, seed_arg, positions_arg
   )
