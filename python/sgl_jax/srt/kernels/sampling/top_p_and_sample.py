@@ -100,7 +100,7 @@ def top_p_and_sample_arrays(
   min_p=None,
   dim0_offset: int = 0,
   unnormalised_probs_sum=None,
-  seed=None,
+  seeds=None,
   positions=None,
 ):
   """
@@ -118,7 +118,7 @@ def top_p_and_sample_arrays(
       min_p: Minimum probability threshold values, shape (batch_size,). Optional.
       dim0_offset: Offset for dim0 (batch) axis, used for sharding (default: 0)
       unnormalised_probs_sum: Unnormalised probability sum for joint filtering, shape (batch_size, 1). Optional.
-      seed: Optional batch-specific seeds for batch-invariant sampling.
+      seeds: Optional batch-specific seeds for batch-invariant sampling.
       positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
@@ -132,47 +132,42 @@ def top_p_and_sample_arrays(
   topk_idx = topk_idx.T
   shape = topk_logits.shape
 
-  topk_logits_scaled = topk_logits / temperature[None, :].astype(
+  topk_logits = topk_logits / temperature[None, :].astype(
     topk_logits.dtype
   )
 
-  topp_logits_scaled = top_p_mask(
-    topk_logits=topk_logits_scaled,
+  topk_logits = top_p_mask(
+    topk_logits=topk_logits,
     p=top_p,
     replace_val=replace_val,
     axis=0,
     unnormalised_probs_sum=unnormalised_probs_sum,
   )
 
+  # Compute probabilities with stable softmax
+  exp_logits = jnp.exp(topk_logits - topk_logits[:1])
+  topk_probs = exp_logits / exp_logits.sum(axis=0, =True)
+    
   # Apply min_p filtering if specified
   if min_p is not None:
-    # Compute probabilities for min_p filtering
-    # Since topk_logits_scaled is already sorted (descending), max is at index 0
-    max_logits = topk_logits_scaled[:1, :]  # Shape: (1, batch_size)
-    exp_logits = jnp.exp(topp_logits_scaled - max_logits)
-    probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
-
     # Filter out probabilities below min_p threshold
-    max_prob = probs[:1, :]  # Shape: (1, batch_size)
+    max_prob = probs[:1]  # Shape: (1, batch_size)
     min_p_threshold = max_prob * min_p[None, :]
-    topp_logits_scaled = jnp.where(
-      probs >= min_p_threshold, topp_logits_scaled, replace_val
+    topk_logits = jnp.where(
+      probs >= min_p_threshold, topk_logits, replace_val
     )
+    topk_probs = jnp.where(
+      probs >= min_p_threshold, topk_probs, 0.
+    )
+    # renorm probs
+    topk_probs /= topk_probs.sum(axis=0, keepdims=True)
 
   # Sample from filtered logits
-  if seed is not None and positions is not None:
+  if seeds is not None and positions is not None:
     # Batch-invariant sampling using prime number hashing
-    # topp_logits_scaled shape: (token, batch)
-    # topk_idx shape: (token, batch) - contains actual token indices
-    # We need to map from topk_idx back to actual token IDs
-    next_token_local_idx = batch_invariant_sparse_categorical(
-      topp_logits_scaled, seed, positions
-    )  # Returns indices into dim 0 (token positions in topk), shape (batch,)
-    # Map from topk position to actual token index
-    # topk_idx[i, j] gives the token index for position i in batch j
-    # We want topk_idx[next_token_local_idx[j], j] for each j
-    batch_indices = jnp.arange(shape[1])
-    next_tokens = topk_idx[next_token_local_idx, batch_indices]
+    next_tokens = batch_invariant_sparse_categorical(
+      topk_probs, topk_idx, seeds, positions
+    )
   else:
     # Standard sampling (batch-dependent)
     # random key splitting is based on idx in ravelled array
@@ -180,7 +175,7 @@ def top_p_and_sample_arrays(
     batch_idx = lax.broadcasted_iota(jnp.int32, shape, 1) + dim0_offset
     next_tokens = sparse_random_categorical(
       rng_key,
-      topp_logits_scaled,
+      topk_logits,
       # these are both transposed, (token, batch) shape
       (batch_idx, topk_idx),
       dim1_size=vocab_size,
