@@ -151,13 +151,13 @@ def top_p_and_sample_arrays(
   # Apply min_p filtering if specified
   if min_p is not None:
     # Filter out probabilities below min_p threshold
-    max_prob = probs[:1]  # Shape: (1, batch_size)
+    max_prob = topk_probs[:1]  # Shape: (1, batch_size)
     min_p_threshold = max_prob * min_p[None, :]
     topk_logits = jnp.where(
-      probs >= min_p_threshold, topk_logits, replace_val
+      topk_probs >= min_p_threshold, topk_logits, replace_val
     )
     topk_probs = jnp.where(
-      probs >= min_p_threshold, topk_probs, 0.
+      topk_probs >= min_p_threshold, topk_probs, 0.
     )
     # renorm probs
     topk_probs /= topk_probs.sum(axis=0, keepdims=True)
