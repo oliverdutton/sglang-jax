@@ -128,11 +128,11 @@ def sparse_random_categorical(
     [gumbel_logits, *indices],
     axis=axis,
   )[1:]
-
+ 
   return sampled_token_indices
 
 
-def batch_invariant_sparse_categorical(logits, seed, positions):
+def batch_invariant_sparse_categorical(probs, indices, seeds, positions, epsilon: float = 1e-9):
   """
   Batch-invariant sampling using prime number hashing.
 
@@ -147,44 +147,30 @@ def batch_invariant_sparse_categorical(logits, seed, positions):
   Returns:
       Sampled token indices of shape (batch,).
   """
-  n, m = logits.shape  # n=tokens (num_tokens), m=batch (batch_size)
-
+  assert seeds.ndim==2 and logits.ndim==2 and positions.ndim==2 and indices.ndim==2
+  u32 = lambda x: jnp.uint32(x) if type(x)==bool else x.astype(jnp.uint32)
   # Compute step_seed for each batch element using prime hashing
   # Using same primes as sglang-jax multinomial_with_seed: 19349663, 73856093
-  step_seed = (seed.astype(jnp.uint32) * jnp.uint32(19349663)) ^ (
-    positions.astype(jnp.uint32) * jnp.uint32(73856093)
+  step_seed = (u32(seeds) * u32(19349663)) ^ (
+    u32(positions) * u32(73856093)
   )
 
-  # Expand to (1, batch) for broadcasting
-  seed_expanded = step_seed[None, :]  # (1, batch)
-
-  # Token indices (rows in transposed format)
-  token_indices = jnp.arange(n)[:, None]  # (token, 1)
-
   # Hash with token indices using primes: 805306457, 479001599
-  hashed = (seed_expanded * jnp.uint32(805306457)) ^ (
-    token_indices.astype(jnp.uint32) * jnp.uint32(479001599)
+  hashed = (step_seed * u32(805306457)) ^ (
+    u32(indices) * u32(479001599)
   )
 
   # Generate uniform samples
   uniform_samples = (hashed % (2**24)).astype(jnp.float32) / (2**24)
-  epsilon = 1e-9
+  # Compute Gumbel noise: -log(-log(u))
   gumbel_noise = -jnp.log(-jnp.log(uniform_samples + epsilon) + epsilon)
 
-  # Add to log probs
-  log_probs = jnp.log(logits.astype(jnp.float32) + epsilon)
-  perturbed_log_probs = log_probs + gumbel_noise
+  # Add Gumbel noise to scaled logits
+  log_probs = jnp.log(probs.astype(jnp.float32) + epsilon)
+  gumbel_logits = log_probs + gumbel_noise
 
-  # Use max_arrays along axis 0 (across tokens for each batch element)
-  # Need to broadcast token_indices to (token, batch) shape
-  token_indices_broadcast = jnp.broadcast_to(token_indices, (n, m))
-
-  # max_arrays returns [max_vals, argmax_indices]
-  # We want the token indices at max, which is the second element
-  sampled_indices = max_arrays(
-    [perturbed_log_probs, token_indices_broadcast],
+  # Find argmax of Gumbel-perturbed logits
+  return max_arrays(
+    [gumbel_logits, indices],
     axis=0,
-  )
-
-  # sampled_indices[1] contains the token indices, shape (batch,)
-  return sampled_indices[1]
+  )[1]
