@@ -12,7 +12,10 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from sgl_jax.srt.kernels.sampling.sparse_random import sparse_random_categorical
+from sgl_jax.srt.kernels.sampling.sparse_random import (
+  sparse_random_categorical,
+  batch_invariant_sparse_categorical,
+)
 from sgl_jax.srt.kernels.sampling.cumsum import cumsum_arrays
 from sgl_jax.srt.kernels.sampling.gather import take_along_axis_arrays
 from sgl_jax.srt.kernels.sampling.utils import NUM_SUBLANES, NUM_LANES
@@ -156,21 +159,36 @@ def top_p_and_sample_arrays(
       probs >= min_p_threshold, topp_logits_scaled, replace_val
     )
 
-  # random key splitting is based on idx in ravelled array
-  # we pass in (batch_idx.T, token_idx.T) and sample across axis 0, taking the token_idx
-  batch_idx = lax.broadcasted_iota(jnp.int32, shape, 1) + dim0_offset
-  next_tokens = sparse_random_categorical(
-    rng_key,
-    topp_logits_scaled,
-    # these are both transposed, (token, batch) shape
-    (batch_idx, topk_idx),
-    dim1_size=vocab_size,
-    axis=0,
-    dtype=jnp.float32,
-    seed=seed,
-    positions=positions,
-    # take sampled_indices[1], the token idx
-  )[1]
+  # Sample from filtered logits
+  if seed is not None and positions is not None:
+    # Batch-invariant sampling using prime number hashing
+    # topp_logits_scaled shape: (token, batch)
+    # topk_idx shape: (token, batch) - contains actual token indices
+    # We need to map from topk_idx back to actual token IDs
+    next_token_local_idx = batch_invariant_sparse_categorical(
+      topp_logits_scaled, seed, positions
+    )  # Returns indices into dim 0 (token positions in topk), shape (batch,)
+    # Map from topk position to actual token index
+    # topk_idx[i, j] gives the token index for position i in batch j
+    # We want topk_idx[next_token_local_idx[j], j] for each j
+    batch_indices = jnp.arange(shape[1])
+    next_tokens = topk_idx[next_token_local_idx, batch_indices]
+  else:
+    # Standard sampling (batch-dependent)
+    # random key splitting is based on idx in ravelled array
+    # we pass in (batch_idx.T, token_idx.T) and sample across axis 0, taking the token_idx
+    batch_idx = lax.broadcasted_iota(jnp.int32, shape, 1) + dim0_offset
+    next_tokens = sparse_random_categorical(
+      rng_key,
+      topp_logits_scaled,
+      # these are both transposed, (token, batch) shape
+      (batch_idx, topk_idx),
+      dim1_size=vocab_size,
+      axis=0,
+      dtype=jnp.float32,
+      # take sampled_indices[1], the token idx
+    )[1]
+
   greedy_sampled = topk_idx[0, :]
   return jnp.where(temperature < sampling_eps, greedy_sampled, next_tokens)
 

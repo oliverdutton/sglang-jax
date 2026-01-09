@@ -47,15 +47,13 @@ def _bits_to_uniform(bits, dtype):
 
 
 def sparse_random_uniform(
-  key_ref, indices, dim1_size, dtype=jnp.float32, minval=0.0, maxval=1.0, seed=None, positions=None
+  key_ref, indices, dim1_size, dtype=jnp.float32, minval=0.0, maxval=1.0
 ):
   """
   Generate uniform random numbers for sparse indices.
 
   Generates random values deterministically based on the indices, similar to
   stateless PRNGs but for specific sparse locations.
-
-  Supports batch-invariant sampling when seed and positions are provided.
 
   Args:
       key_ref: RNG key.
@@ -64,8 +62,6 @@ def sparse_random_uniform(
       dtype: Output data type (default: float32).
       minval: Minimum value (inclusive).
       maxval: Maximum value (exclusive).
-      seed: Optional batch-specific seeds for batch-invariant sampling.
-      positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
       Array of uniform random values with same shape as indices[0].
@@ -75,23 +71,8 @@ def sparse_random_uniform(
   if key_ref.ndim == 0:
     # Scalar JAX key - extract data and reshape
     key_ref = jnp.reshape(jax.random.key_data(key_ref), (1, 2))
-
-  # Compute counter for PRNG
-  if seed is not None and positions is not None:
-    # Batch-invariant sampling using prime number hashing
-    # Matches multinomial_with_seed in sampler.py
-    batch_idx = indices[0]
-    token_idx = indices[1]
-
-    # Hash: (seed * prime1 ^ position * prime2) * prime3 ^ token_idx * prime4
-    # Using same primes as sglang-jax: 19349663, 73856093, 805306457, 479001599
-    step_seed = (seed[batch_idx].astype(jnp.uint32) * jnp.uint32(19349663)) ^ (positions[batch_idx].astype(jnp.uint32) * jnp.uint32(73856093))
-    counts_lo = (step_seed * jnp.uint32(805306457)) ^ (token_idx.astype(jnp.uint32) * jnp.uint32(479001599))
-  else:
-    # Standard sampling (batch-dependent)
-    counts_lo = indices[0] * dim1_size + indices[1]
-    counts_lo = counts_lo.astype(jnp.uint32)
-
+  counts_lo = indices[0] * dim1_size + indices[1]
+  counts_lo = counts_lo.astype(jnp.uint32)
   counts_hi = jnp.zeros_like(counts_lo)
   k1 = jnp.reshape(key_ref[0, 0], (1, 1))
   k2 = jnp.reshape(key_ref[0, 1], (1, 1))
@@ -108,12 +89,10 @@ def sparse_random_uniform(
 
 
 def sparse_random_categorical(
-  key_ref, logits, indices, dim1_size, axis=-1, dtype=jnp.float32, seed=None, positions=None
+  key_ref, logits, indices, dim1_size, axis=-1, dtype=jnp.float32
 ):
   """
   Perform Gumbel-max sampling on sparse logits.
-
-  Supports batch-invariant sampling when seed and positions are provided.
 
   Args:
       key_ref: RNG key.
@@ -122,8 +101,6 @@ def sparse_random_categorical(
       dim1_size: Size of dimension 1 (for RNG seeding).
       axis: Axis along which to perform max reduction (default: -1).
       dtype: Dtype for computation (must be float32).
-      seed: Optional batch-specific seeds for batch-invariant sampling.
-      positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
       Sampled indices.
@@ -141,8 +118,6 @@ def sparse_random_categorical(
     dtype=jnp.float32,
     minval=jnp.finfo(jnp.float32).tiny,
     maxval=1.0,
-    seed=seed,
-    positions=positions,
   )
   # Compute Gumbel noise: -log(-log(u))
   gumbel = -jnp.log(-jnp.log(u))
@@ -155,3 +130,61 @@ def sparse_random_categorical(
   )[1:]
 
   return sampled_token_indices
+
+
+def batch_invariant_sparse_categorical(logits, seed, positions):
+  """
+  Batch-invariant sampling using prime number hashing.
+
+  Matches the approach in multinomial_with_seed but adapted for
+  transposed (token, batch) format and using max_arrays.
+
+  Args:
+      logits: Logits of shape (token, batch) [transposed format].
+      seed: Seeds of shape (batch,) - unique per request.
+      positions: Positions of shape (batch,) - position in sequence.
+
+  Returns:
+      Sampled token indices of shape (batch,).
+  """
+  n, m = logits.shape  # n=tokens (num_tokens), m=batch (batch_size)
+
+  # Compute step_seed for each batch element using prime hashing
+  # Using same primes as sglang-jax multinomial_with_seed: 19349663, 73856093
+  step_seed = (seed.astype(jnp.uint32) * jnp.uint32(19349663)) ^ (
+    positions.astype(jnp.uint32) * jnp.uint32(73856093)
+  )
+
+  # Expand to (1, batch) for broadcasting
+  seed_expanded = step_seed[None, :]  # (1, batch)
+
+  # Token indices (rows in transposed format)
+  token_indices = jnp.arange(n)[:, None]  # (token, 1)
+
+  # Hash with token indices using primes: 805306457, 479001599
+  hashed = (seed_expanded * jnp.uint32(805306457)) ^ (
+    token_indices.astype(jnp.uint32) * jnp.uint32(479001599)
+  )
+
+  # Generate uniform samples
+  uniform_samples = (hashed % (2**24)).astype(jnp.float32) / (2**24)
+  epsilon = 1e-9
+  gumbel_noise = -jnp.log(-jnp.log(uniform_samples + epsilon) + epsilon)
+
+  # Add to log probs
+  log_probs = jnp.log(logits.astype(jnp.float32) + epsilon)
+  perturbed_log_probs = log_probs + gumbel_noise
+
+  # Use max_arrays along axis 0 (across tokens for each batch element)
+  # Need to broadcast token_indices to (token, batch) shape
+  token_indices_broadcast = jnp.broadcast_to(token_indices, (n, m))
+
+  # max_arrays returns [max_vals, argmax_indices]
+  # We want the token indices at max, which is the second element
+  sampled_indices = max_arrays(
+    [perturbed_log_probs, token_indices_broadcast],
+    axis=0,
+  )
+
+  # sampled_indices[1] contains the token indices, shape (batch,)
+  return sampled_indices[1]
