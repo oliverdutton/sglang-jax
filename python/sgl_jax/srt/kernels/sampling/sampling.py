@@ -20,12 +20,12 @@ def topk_topp_and_sample(
   bins_topm_schedule: int | None = None,
   sampling_eps: float = 1e-5,
   replace_val: float = -1e12,
-  seed=None,
+  seeds=None,
   positions=None,
 ):
   """Combined top-k, top-p filtering, and sampling for vLLM inference.
 
-  Supports batch-invariant sampling when seed and positions are provided.
+  Supports batch-invariant sampling when seeds and positions are provided.
 
   Args:
     rng_key: RNG key for sampling.
@@ -36,7 +36,7 @@ def topk_topp_and_sample(
     bins_topm_schedule: Optional custom schedule for binned top-m computation.
     sampling_eps: Use greedy token if temperature < eps
     replace_val: Replace padding entries in probabilities with constant
-    seed: Optional batch-specific seeds for batch-invariant sampling.
+    seeds: Optional batch-specific seeds for batch-invariant sampling.
     positions: Optional sequence positions for batch-invariant sampling.
 
   Returns:
@@ -65,6 +65,6 @@ def topk_topp_and_sample(
     vocab_size=vocab_size,
     replace_val=replace_val,
     sampling_eps=sampling_eps,
-    seed=seed,
+    seeds=seeds,
     positions=positions,
   )
