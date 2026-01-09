@@ -156,7 +156,7 @@ def batch_invariant_sparse_categorical(probs, indices, seeds, positions, epsilon
   )
 
   # Hash with token indices using primes: 805306457, 479001599
-  hashed = (step_seed * u32(805306457)) ^ (
+  hashed = (step_seed[None,:] * u32(805306457)) ^ (
     u32(indices) * u32(479001599)
   )
 
