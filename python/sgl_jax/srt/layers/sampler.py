@@ -47,7 +47,7 @@ class Sampler(nnx.Module):
         probs = jax.nn.softmax(processed_logits, axis=-1)
 
         args = (
-            logits,
+            processed_logits,
             probs,
             sampling_metadata.top_ks,
             sampling_metadata.top_ps,
@@ -345,7 +345,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax(
 ):
     if use_sort_for_toppk_minp:
         return top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args)
-    return top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args)
+    return top_k_top_p_min_p_sampling_from_logits_jax_with_mask(args)
 
 
 def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
@@ -380,11 +380,10 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
 
         probs_sort = jnp.take_along_axis(sanitized_probs, probs_idx, axis=-1)
 
-    probs_sum = jnp.cumsum(probs_sort, axis=-1)
-
     top_k_mask = jnp.arange(0, probs.shape[-1]).reshape(1, -1) >= top_ks.reshape(-1, 1)
     probs_sort = jnp.where(top_k_mask, 0.0, probs_sort)
 
+    probs_sum = jnp.cumsum(probs_sort, axis=-1)
     top_p_mask = (probs_sum - probs_sort) > top_ps.reshape(-1, 1)
     probs_sort = jnp.where(top_p_mask, 0.0, probs_sort)
 
@@ -412,7 +411,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
     return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
 
 
-def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
+def top_k_top_p_min_p_sampling_from_logits_jax_with_mask(args):
     (
         logits,
         _,
@@ -420,7 +419,7 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
         top_ps,
         min_ps,
         positions,
-        temperatures,
+        _,
         sampling_seeds,
         need_min_p_sampling,
         rng,
@@ -428,9 +427,6 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
     logits = logits.astype(jnp.float32)
     logits = topk_mask(logits, top_ks, replace_val=-1e12)
     logits = topp_mask(logits, top_ps, replace_val=-1e12)
-
-    temperatures = temperatures.astype(logits.dtype)
-    logits = jnp.divide(logits, temperatures)
 
     min_p_operands = (logits, min_ps)
     apply_min_p_filter_fn = lambda op: _apply_min_p_filter((*op, False))
