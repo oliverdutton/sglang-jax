@@ -12,26 +12,12 @@ from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
-from sgl_jax.srt.utils import get_bool_env_var
-
-# Import Pallas sampling kernels
-try:
-    from sgl_jax.srt.kernels.sampling import topk_topp_and_sample
-    PALLAS_SAMPLING_AVAILABLE = True
-except ImportError:
-    PALLAS_SAMPLING_AVAILABLE = False
-    topk_topp_and_sample = None
 
 
 class Sampler(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs = None, mesh: Mesh = None, use_pallas_sampling: bool = None):
+    def __init__(self, rngs: nnx.Rngs = None, mesh: Mesh = None):
         self.rngs = rngs
         self.mesh = mesh
-        # Enable Pallas sampling if available and on TPU, or if explicitly requested
-        if use_pallas_sampling is None:
-            # Check environment variable
-            use_pallas_sampling = get_bool_env_var("SGLANG_USE_PALLAS_SAMPLING", False)
-        self.use_pallas_sampling = use_pallas_sampling and PALLAS_SAMPLING_AVAILABLE and is_tpu_runtime()
 
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
@@ -40,47 +26,9 @@ class Sampler(nnx.Module):
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
-    def _pallas_sampling(self, operands):
-        """Pallas-accelerated sampling branch"""
-        logits, sampling_metadata, rng = operands
-
-        logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
-
-        # Get max_k value for Pallas sampling
-        max_k = int(jnp.max(sampling_metadata.top_ks))
-
-        # Create a simple metadata structure for Pallas sampling
-        # This matches the TPUSupportedSamplingMetadata structure
-        from types import SimpleNamespace
-        tpu_sampling_metadata = SimpleNamespace(
-            top_k=sampling_metadata.top_ks,
-            top_p=sampling_metadata.top_ps,
-            temperature=sampling_metadata.temperatures.flatten(),
-        )
-
-        # Call Pallas sampling kernel
-        vocab_size = logits.shape[1]
-        batch_next_token_ids = topk_topp_and_sample(
-            rng,
-            logits,
-            tpu_sampling_metadata,
-            max_k=max_k,
-            sampling_eps=1e-6,
-            replace_val=-1e12,
-        )
-
-        # Compute logprobs for return
-        logprobs = jax.nn.log_softmax(logits, axis=-1)
-        return batch_next_token_ids, logprobs
-
     def _regular_sampling(self, operands):
         """Regular sampling branch"""
         logits, sampling_metadata, rng, use_sort_for_toppk_minp = operands
-
-        # Use Pallas sampling if enabled and min_p is not needed
-        # (min_p is handled separately in the Pallas kernel - we need to integrate it)
-        if self.use_pallas_sampling and not sampling_metadata.need_min_p_sampling:
-            return self._pallas_sampling((logits, sampling_metadata, rng))
 
         logits = lax.with_sharding_constraint(logits, NamedSharding(self.mesh, P(None, None)))
 
