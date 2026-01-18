@@ -1555,120 +1555,153 @@ def run_benchmark(args_: argparse.Namespace):
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
 
-    if args.tokenize_prompt:
-        assert (
-            args.backend == "sgl-jax"
-        ), "`--tokenize-prompt` only compatible with `--backend sgl-jax` currently"
+    # Loop over top_k values of 64 and 65 for SGLang benchmarking
+    topk_values = [64, 65]
+    results = []
 
-    # Set url
-    if args.port is None:
-        args.port = {
-            "sglang": 30000,
-            "sglang-native": 30000,
-            "sglang-oai": 30000,
-            "lmdeploy": 23333,
-            "vllm": 8000,
-            "trt": 8000,
-            "gserver": 9988,
-            "truss": 8080,
-        }.get(args.backend, 30000)
+    for topk in topk_values:
+        print(f"\n{'='*60}")
+        print(f"Running benchmark with top_k={topk}")
+        print(f"{'='*60}\n")
 
-    model_url = (
-        f"{args.base_url}/v1/models"
-        if args.base_url
-        else f"http://{args.host}:{args.port}/v1/models"
-    )
+        # Add top_k to sampling_params in extra_request_body
+        current_extra_body = extra_request_body.copy()
+        if "sampling_params" not in current_extra_body:
+            current_extra_body["sampling_params"] = {}
+        current_extra_body["sampling_params"]["top_k"] = topk
 
-    if args.backend in ["sglang", "sglang-native", "sgl-jax"]:
-        api_url = (
-            f"{args.base_url}/generate"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/generate"
-        )
-    elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
-        api_url = (
-            f"{args.base_url}/v1/completions"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v1/completions"
-        )
-    elif args.backend == "trt":
-        api_url = (
-            f"{args.base_url}/v2/models/ensemble/generate_stream"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
-        )
-        if args.model is None:
-            print("Please provide a model using `--model` when using `trt` backend.")
-            sys.exit(1)
-    elif args.backend == "gserver":
-        api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
-        args.model = args.model or "default"
-    elif args.backend == "truss":
-        api_url = (
-            f"{args.base_url}/v1/models/model:predict"
-            if args.base_url
-            else f"http://{args.host}:{args.port}/v1/models/model:predict"
-        )
-    base_url = f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
+        if args.tokenize_prompt:
+            assert (
+                args.backend == "sgl-jax"
+            ), "`--tokenize-prompt` only compatible with `--backend sgl-jax` currently"
 
-    # Get model name
-    if args.model is None:
-        if args.backend == "truss":
-            print(
-                "Please provide a model with `--model` when using truss backend. e.g. --model meta-llama/Llama-3.1-8B-Instruct"
+        # Set url
+        if args.port is None:
+            args.port = {
+                "sglang": 30000,
+                "sglang-native": 30000,
+                "sglang-oai": 30000,
+                "lmdeploy": 23333,
+                "vllm": 8000,
+                "trt": 8000,
+                "gserver": 9988,
+                "truss": 8080,
+            }.get(args.backend, 30000)
+
+        model_url = (
+            f"{args.base_url}/v1/models"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/models"
+        )
+
+        if args.backend in ["sglang", "sglang-native", "sgl-jax"]:
+            api_url = (
+                f"{args.base_url}/generate"
+                if args.base_url
+                else f"http://{args.host}:{args.port}/generate"
             )
-            sys.exit(1)
-        try:
-            response = requests.get(model_url, headers=get_auth_headers())
-            model_list = response.json().get("data", [])
-            args.model = model_list[0]["id"] if model_list else None
-        except Exception as e:
-            print(f"Failed to fetch model from {model_url}. Error: {e}")
-            print("Please specify the correct host and port using `--host` and `--port`.")
-            sys.exit(1)
+        elif args.backend in ["sglang-oai", "vllm", "lmdeploy"]:
+            api_url = (
+                f"{args.base_url}/v1/completions"
+                if args.base_url
+                else f"http://{args.host}:{args.port}/v1/completions"
+            )
+        elif args.backend == "trt":
+            api_url = (
+                f"{args.base_url}/v2/models/ensemble/generate_stream"
+                if args.base_url
+                else f"http://{args.host}:{args.port}/v2/models/ensemble/generate_stream"
+            )
+            if args.model is None:
+                print("Please provide a model using `--model` when using `trt` backend.")
+                sys.exit(1)
+        elif args.backend == "gserver":
+            api_url = args.base_url if args.base_url else f"{args.host}:{args.port}"
+            args.model = args.model or "default"
+        elif args.backend == "truss":
+            api_url = (
+                f"{args.base_url}/v1/models/model:predict"
+                if args.base_url
+                else f"http://{args.host}:{args.port}/v1/models/model:predict"
+            )
+        base_url = f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
 
-    if args.model is None:
-        print("No model specified or found. Please provide a model using `--model`.")
-        sys.exit(1)
+        # Get model name (only on first iteration to avoid redundant checks)
+        if topk == topk_values[0]:
+            if args.model is None:
+                if args.backend == "truss":
+                    print(
+                        "Please provide a model with `--model` when using truss backend. e.g. --model meta-llama/Llama-3.1-8B-Instruct"
+                    )
+                    sys.exit(1)
+                try:
+                    response = requests.get(model_url, headers=get_auth_headers())
+                    model_list = response.json().get("data", [])
+                    args.model = model_list[0]["id"] if model_list else None
+                except Exception as e:
+                    print(f"Failed to fetch model from {model_url}. Error: {e}")
+                    print("Please specify the correct host and port using `--host` and `--port`.")
+                    sys.exit(1)
 
-    if not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+            if args.model is None:
+                print("No model specified or found. Please provide a model using `--model`.")
+                sys.exit(1)
+
+            if not check_chat_template(args.model):
+                print(
+                    "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+                    "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+                )
+
+        print(f"{args}\n")
+
+        # Read dataset (only on first iteration)
+        if topk == topk_values[0]:
+            backend = args.backend
+            model_id = args.model
+            tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
+            tokenizer = get_tokenizer(tokenizer_id)
+            input_requests = get_dataset(args, tokenizer)
+
+            # compatible with SimpleNamespace
+            if not hasattr(args, "flush_cache"):
+                args.flush_cache = False
+
+        result = asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                request_rate=args.request_rate,
+                max_concurrency=args.max_concurrency,
+                disable_tqdm=args.disable_tqdm,
+                lora_names=args.lora_name,
+                extra_request_body=current_extra_body,
+                profile=args.profile,
+                pd_separated=args.pd_separated,
+                flush_cache=args.flush_cache,
+                warmup_requests=args.warmup_requests,
+            )
         )
+        result["top_k"] = topk
+        results.append(result)
 
-    print(f"{args}\n")
+    # Print summary of all runs
+    print("\n" + "=" * 60)
+    print("SUMMARY: Benchmark Results for All top_k Values")
+    print("=" * 60)
+    for result in results:
+        print(f"\ntop_k={result['top_k']}:")
+        print(f"  Output throughput: {result.get('output_throughput', 'N/A'):.2f} tok/s")
+        print(f"  Total throughput: {result.get('total_throughput', 'N/A'):.2f} tok/s")
+        print(f"  Mean TTFT: {result.get('mean_ttft_ms', 'N/A'):.2f} ms")
+        print(f"  Mean ITL: {result.get('mean_itl_ms', 'N/A'):.2f} ms")
+    print("=" * 60)
 
-    # Read dataset
-    backend = args.backend
-    model_id = args.model
-    tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
-    tokenizer = get_tokenizer(tokenizer_id)
-    input_requests = get_dataset(args, tokenizer)
-
-    # compatible with SimpleNamespace
-    if not hasattr(args, "flush_cache"):
-        args.flush_cache = False
-
-    return asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            request_rate=args.request_rate,
-            max_concurrency=args.max_concurrency,
-            disable_tqdm=args.disable_tqdm,
-            lora_names=args.lora_name,
-            extra_request_body=extra_request_body,
-            profile=args.profile,
-            pd_separated=args.pd_separated,
-            flush_cache=args.flush_cache,
-            warmup_requests=args.warmup_requests,
-        )
-    )
+    return results
 
 
 def set_ulimit(target_soft_limit=65535):

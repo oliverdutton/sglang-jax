@@ -1,0 +1,281 @@
+#!/bin/bash
+set -e
+
+COMMAND=${1:-}
+SUBCOMMAND=${2:-}
+
+# Default values
+DEFAULT_TP_SIZE=4
+DEFAULT_TOPK_THRESHOLD=64
+DEFAULT_MODEL="meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+# Function to display usage
+usage() {
+    echo "Usage: ./run <command> <subcommand> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  install <sgl|vllm>                    - Install SGLang-JAX or vLLM"
+    echo "  serve <sgl|vllm> [options]            - Start server"
+    echo "  bench <sgl|vllm> [options]            - Run benchmarks"
+    echo "  profile vllm [options]                - Run profiling"
+    echo ""
+    echo "Options:"
+    echo "  --tp-size <N>           - Tensor parallel size (default: $DEFAULT_TP_SIZE)"
+    echo "  --topk <N>              - Top-k threshold (default: $DEFAULT_TOPK_THRESHOLD)"
+    echo "  --model <name>          - Model name (default: $DEFAULT_MODEL)"
+    echo ""
+    echo "Examples:"
+    echo "  ./run serve vllm --tp-size 2 --model google/gemma-2-9b-it"
+    echo "  ./run serve sgl --tp-size 8 --topk 128"
+    echo "  ./run bench vllm --topk 65"
+    echo ""
+    exit 1
+}
+
+# Check if command is provided
+if [ -z "$COMMAND" ]; then
+    usage
+fi
+
+# Parse arguments
+TP_SIZE=$DEFAULT_TP_SIZE
+TOPK_THRESHOLD=$DEFAULT_TOPK_THRESHOLD
+MODEL=""
+
+shift 2  # Remove command and subcommand from args
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --tp-size)
+            TP_SIZE="$2"
+            shift 2
+            ;;
+        --topk)
+            TOPK_THRESHOLD="$2"
+            shift 2
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+# Install common software and Python 3.12
+echo "Setting up Python 3.12 environment..."
+sudo apt-get update
+sudo apt-get install -y software-properties-common git curl wget build-essential
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt-get update
+sudo apt-get install -y python3.12 python3.12-venv python3.12-dev python3-pip
+
+# Create and activate virtual environment with Python 3.12
+if [ ! -d ~/venv312 ]; then
+    python3.12 -m venv ~/venv312
+fi
+source ~/venv312/bin/activate
+
+# Add to bashrc if not already present
+if ! grep -q "source ~/venv312/bin/activate" ~/.bashrc; then
+    echo 'source ~/venv312/bin/activate' >> ~/.bashrc
+fi
+
+# Upgrade pip in the virtual environment
+pip install -q -U pip setuptools wheel
+
+# Set environment variables
+export PALLAS_SAMPLING_TOPK_THRESHOLD=$TOPK_THRESHOLD
+# HF_TOKEN should be set in your environment for downloading models
+# export HF_TOKEN=your_huggingface_token_here
+
+# Handle commands
+case "$COMMAND" in
+    install)
+        case "$SUBCOMMAND" in
+            sgl)
+                echo "Installing SGLang-JAX..."
+                if [ ! -d ~/sglang-jax ]; then
+                    git clone git@github.com:sgl-project/sglang-jax.git ~/sglang-jax
+                fi
+                cd ~/sglang-jax
+                git pull
+                pip3 install -e python[all]
+                cd ~
+                ;;
+            vllm)
+                echo "Installing vLLM..."
+                pip install -q -U vllm-tpu==0.13.3
+                if [ ! -d ~/tpu-inference ]; then
+                    git clone -q -b pallas_sampling --single-branch https://github.com/oliverdutton/tpu-inference.git ~/tpu-inference
+                fi
+                cd ~/tpu-inference
+                git pull
+                pip install -U -q .
+                cd ~
+                ;;
+            *)
+                echo "Error: Unknown subcommand for install: $SUBCOMMAND"
+                usage
+                ;;
+        esac
+        ;;
+
+    serve)
+        case "$SUBCOMMAND" in
+            vllm)
+                # Use provided model or default
+                if [ -z "$MODEL" ]; then
+                    MODEL=$DEFAULT_MODEL
+                fi
+
+                echo "Starting vLLM server..."
+                echo "  Model: $MODEL"
+                echo "  Tensor Parallel Size: $TP_SIZE"
+                echo "  Top-K Threshold: $TOPK_THRESHOLD"
+
+                vllm serve $MODEL \
+                    --tensor-parallel-size $TP_SIZE \
+                    --swap-space 16 \
+                    --disable-log-stats \
+                    --disable-log-requests \
+                    --load-format dummy \
+                    --max-model-len 8192 &
+                ;;
+            sgl)
+                # Use provided model or default
+                if [ -z "$MODEL" ]; then
+                    MODEL=$DEFAULT_MODEL
+                fi
+
+                echo "Starting SGLang-JAX server..."
+                echo "  Model: $MODEL"
+                echo "  TP Size: $TP_SIZE"
+                echo "  Top-K Threshold: $TOPK_THRESHOLD"
+
+                JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache \
+                uv run python -u -m sgl_jax.launch_server \
+                    --model-path $MODEL \
+                    --trust-remote-code \
+                    --tp-size=$TP_SIZE \
+                    --device=tpu \
+                    --mem-fraction-static=0.95 \
+                    --chunked-prefill-size=2048 \
+                    --download-dir=/tmp \
+                    --dtype=bfloat16 \
+                    --max-running-requests 256 \
+                    --skip-server-warmup \
+                    --page-size=128 \
+                    --disable-radix-cache
+                ;;
+            *)
+                echo "Error: Unknown subcommand for serve: $SUBCOMMAND"
+                usage
+                ;;
+        esac
+        ;;
+
+    bench)
+        case "$SUBCOMMAND" in
+            vllm)
+                # Use provided model or default
+                if [ -z "$MODEL" ]; then
+                    MODEL=$DEFAULT_MODEL
+                fi
+
+                echo "Running vLLM benchmarks..."
+                echo "  Model: $MODEL"
+                echo "  Top-K Threshold: $TOPK_THRESHOLD"
+
+                # Loop over top-k values 64 and 65
+                for topk in 64 65; do
+                    echo "======================================="
+                    echo "Benchmarking with top-k=$topk"
+                    echo "======================================="
+                    python ~/tpu-inference/scripts/vllm/benchmarking/benchmark_serving.py \
+                        --backend vllm \
+                        --model $MODEL \
+                        --dataset-name random \
+                        --num-prompts 200 \
+                        --top-k $topk \
+                        --temperature 1.0 \
+                        --top-p 0.95 \
+                        --random-input-len 1024 \
+                        --random-output-len 2048 \
+                        --request-rate inf
+                done
+                ;;
+            sgl)
+                echo "Running SGLang-JAX benchmarks..."
+                echo "  Top-K Threshold: $TOPK_THRESHOLD"
+
+                backend=sgl-jax
+                num_prompts_per_concurrency=3
+                input_seq_lens=(8192)
+                output_seq_lens=(1024)
+                max_concurrencies=(8 16 32 64 128 256)
+
+                for input_seq_len in "${input_seq_lens[@]}"; do
+                    for output_seq_len in "${output_seq_lens[@]}"; do
+                        echo "======================================="
+                        echo "Testing with ISL/OSL: $input_seq_len/$output_seq_len"
+                        echo "======================================="
+                        for max_concurrency in "${max_concurrencies[@]}"; do
+                            echo "Benchmark on max_concurrency=$max_concurrency"
+                            num_prompts=$((num_prompts_per_concurrency * max_concurrency))
+                            uv run python -m sgl_jax.bench_serving \
+                                --backend ${backend} \
+                                --dataset-name random \
+                                --num-prompts ${num_prompts} \
+                                --random-input-len ${input_seq_len} \
+                                --random-output-len ${output_seq_len} \
+                                --max-concurrency ${max_concurrency} \
+                                --random-range-ratio 1 \
+                                --disable-ignore-eos \
+                                --warmup-requests 0
+                        done
+                    done
+                done
+                ;;
+            *)
+                echo "Error: Unknown subcommand for bench: $SUBCOMMAND"
+                usage
+                ;;
+        esac
+        ;;
+
+    profile)
+        if [ "$SUBCOMMAND" = "vllm" ]; then
+            # Use provided model or default
+            if [ -z "$MODEL" ]; then
+                MODEL=$DEFAULT_MODEL
+            fi
+
+            echo "Running vLLM profiling..."
+            echo "  Model: $MODEL"
+            echo "  Top-K Threshold: $TOPK_THRESHOLD"
+
+            python ~/tpu-inference/examples/tpu_profiling.py \
+                --model $MODEL \
+                --input-len 1024 \
+                --output-len 10 \
+                --batch-size 1024 \
+                --profile-result-dir=~/profiles/ \
+                --top-k $TOPK_THRESHOLD \
+                --top-p 0.95
+        else
+            echo "Error: Profile only supports 'vllm' subcommand"
+            usage
+        fi
+        ;;
+
+    *)
+        echo "Error: Unknown command: $COMMAND"
+        usage
+        ;;
+esac
+
+echo "Command completed successfully!"
