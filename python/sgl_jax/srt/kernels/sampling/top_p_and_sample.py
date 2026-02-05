@@ -1,0 +1,441 @@
+"""
+Fused TPU sampling kernel implementing top-p filtering, temperature scaling,
+and categorical sampling.
+"""
+
+import functools
+import jax
+import jax.numpy as jnp
+from jax import jit, lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from jax.experimental.custom_partitioning import custom_partitioning
+from jax.sharding import NamedSharding, PartitionSpec as P
+
+from sgl_jax.srt.kernels.sampling.sparse_random import (
+  sparse_random_categorical,
+  batch_invariant_sparse_categorical,
+)
+from sgl_jax.srt.kernels.sampling.cumsum import cumsum_arrays
+from sgl_jax.srt.kernels.sampling.gather import take_along_axis_arrays
+from sgl_jax.srt.kernels.sampling.utils import NUM_SUBLANES, NUM_LANES
+
+
+def broadcast_to(x, shape):
+  if x.shape[1] == shape[1] and shape[0] % NUM_SUBLANES == 0 and x.shape[0] == 1:
+    # workaround for jax issue #34001
+    return pltpu.repeat(
+      jnp.broadcast_to(x, (NUM_SUBLANES, shape[1])),
+      shape[0] // NUM_SUBLANES,
+      axis=0,
+    )
+  if x.shape[1] == shape[1] and x.shape[0] == 1:
+    # similar issue for (1, 128) to (5, 128) or (17, 128)
+    return pltpu.repeat(x, shape[0], axis=0)
+  return jnp.broadcast_to(x, shape)
+
+
+def top_p_mask(*, topk_logits, p, replace_val, axis, no_pallas_code=False):
+  """
+  Apply top-p filtering mask to sorted logits.
+
+  Args:
+      topk_logits: Sorted logits (descending order)
+      p: Top-p threshold(s)
+      replace_val: Value to replace filtered logits with
+      axis: Axis along which to apply filtering (must be 0)
+
+  Returns:
+      Masked logits with values outside top-p set to replace_val
+  """
+  if axis != 0:
+    raise NotImplementedError("topp_mask only supports axis=0")
+
+  shape = topk_logits.shape
+
+  # Compute softmax probabilities
+  # For numerical stability, subtract max (pre-sorted so its the first element)
+  exp_logits = jnp.exp(topk_logits - topk_logits[:1, :])
+  probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
+
+  # Top-p filtering using cumsum on sorted probabilities
+  cumsum_probs = cumsum_arrays(probs, axis=0)
+
+  # Find last idx where top-p probability mass is (over)covered
+  threshold_idx = (cumsum_probs < p[None, :]).sum(0, keepdims=True)
+  # Clamp for p=1.0 case
+  threshold_idx = jnp.where(p[None, :] == 1.0, shape[0] - 1, threshold_idx)
+  # vLLM current implementation uses binary search, computing a threshold.
+  # so ties at the threshold are all included
+  # we replicate that behavior here
+  
+  # we test the jax fn, rather than wrapped in a pallas fn. However, due to bug work around we use pltpu.repeat. We have this awkward if statement to support both test in jax and usage in Pallas
+  broadcast_fn = jnp.broadcast_to if no_pallas_code else broadcast_to
+  thresholds = take_along_axis_arrays(
+    topk_logits, broadcast_fn(threshold_idx, shape), axis=0
+  )
+  topp_logits = jnp.where(topk_logits >= thresholds, topk_logits, replace_val)
+
+  return topp_logits
+
+
+def top_p_and_sample_arrays(
+  *,
+  topk_logits,
+  topk_idx,
+  rng_key,
+  top_p,
+  temperature,
+  vocab_size,
+  replace_val,
+  sampling_eps,
+  min_p=None,
+  dim0_offset: int = 0,
+  seeds=None,
+  positions=None,
+):
+  """
+  Implements top-p filtering, min-p filtering, temperature scaling, and sampling.
+
+  Args:
+      topk_logits: Sorted logits of shape (batch_size, k)
+      topk_idx: Indices corresponding to sorted logits of shape (batch_size, k)
+      rng_key: RNG key for sampling, shape (1, 2)
+      top_p: Top-p threshold values, shape (batch_size,)
+      temperature: Temperature values, shape (batch_size,)
+      vocab_size: Vocabulary size for sampling
+      replace_val: Value to replace filtered logits with
+      sampling_eps: if temperature below eps, greedy token is taken
+      min_p: Minimum probability threshold values, shape (batch_size,). Optional.
+      dim0_offset: Offset for dim0 (batch) axis, used for sharding (default: 0)
+      seeds: Optional batch-specific seeds for batch-invariant sampling.
+      positions: Optional sequence positions for batch-invariant sampling.
+
+  Returns:
+      Sampled tokens of shape (batch_size,)
+  """
+  topk_logits = topk_logits.astype(jnp.float32)
+
+  # To do reductions and broadcast across sublanes rather than lanes (which are slow)
+  # we shift sampling to dim 0
+  topk_logits = topk_logits.T
+  topk_idx = topk_idx.T
+  shape = topk_logits.shape
+
+  topk_logits = topk_logits / temperature[None, :].astype(
+    topk_logits.dtype
+  )
+
+  topk_logits = top_p_mask(
+    topk_logits=topk_logits,
+    p=top_p,
+    replace_val=replace_val,
+    axis=0,
+  )
+
+  # Compute probabilities with stable softmax
+  exp_logits = jnp.exp(topk_logits - topk_logits[:1])
+  topk_probs = exp_logits / exp_logits.sum(axis=0, keepdims=True)
+    
+  # Apply min_p filtering if specified
+  if min_p is not None:
+    # Filter out probabilities below min_p threshold
+    max_prob = topk_probs[:1]  # Shape: (1, batch_size)
+    min_p_threshold = max_prob * min_p[None, :]
+    topk_logits = jnp.where(
+      topk_probs >= min_p_threshold, topk_logits, replace_val
+    )
+    topk_probs = jnp.where(
+      topk_probs >= min_p_threshold, topk_probs, 0.
+    )
+    # renorm probs
+    topk_probs /= topk_probs.sum(axis=0, keepdims=True)
+
+  # Sample from filtered logits
+  if seeds is not None and positions is not None:
+    # Batch-invariant sampling using prime number hashing
+    next_tokens = batch_invariant_sparse_categorical(
+      topk_probs, topk_idx, seeds, positions
+    )
+  else:
+    # Standard sampling (batch-dependent)
+    # random key splitting is based on idx in ravelled array
+    # we pass in (batch_idx.T, token_idx.T) and sample across axis 0, taking the token_idx
+    batch_idx = lax.broadcasted_iota(jnp.int32, shape, 1) + dim0_offset
+    next_tokens = sparse_random_categorical(
+      rng_key,
+      topk_logits,
+      # these are both transposed, (token, batch) shape
+      (batch_idx, topk_idx),
+      dim1_size=vocab_size,
+      axis=0,
+      dtype=jnp.float32,
+      # take sampled_indices[1], the token idx
+    )[1]
+
+  greedy_sampled = topk_idx[0, :]
+  return jnp.where(temperature < sampling_eps, greedy_sampled, next_tokens)
+
+
+def top_p_and_sample_refs(
+  topk_logits_ref,
+  topk_idx_ref,
+  rng_key_ref,
+  top_p_ref,
+  temperature_ref,
+  dim0_offset_ref,
+  min_p_ref,
+  seeds_ref,
+  positions_ref,
+  sampled_tokens_ref,
+  *,
+  vocab_size: int,
+  replace_val: float,
+  sampling_eps: float,
+  has_min_p: bool,
+  has_seeds: bool,
+  has_positions: bool,
+):
+  """
+  Fused kernel implementing top-p filtering, min-p filtering, temperature scaling, and sampling.
+
+  Args:
+      topk_logits_ref: Reference to sorted logits
+      topk_idx_ref: Reference to sorted indices
+      rng_key_ref: Reference to RNG key (SMEM)
+      top_p_ref: Reference to top-p values
+      temperature_ref: Reference to temperature values
+      dim0_offset_ref: Reference to dim0 offset for sharding (SMEM, shape (1,))
+      min_p_ref: Reference to min-p values (may contain dummy data if has_min_p=False)
+      seeds_ref: Reference to batch-specific seeds (may contain dummy data if has_seeds=False)
+      positions_ref: Reference to sequence positions (may contain dummy data if has_positions=False)
+      sampled_tokens_ref: Reference to output sampled tokens
+      vocab_size: Vocabulary size
+      replace_val: Value to replace filtered logits with
+      sampling_eps: if temperature below eps, greedy token is taken
+      has_min_p: Whether to use min_p_ref
+      has_seeds: Whether to use seeds_ref
+      has_positions: Whether to use positions_ref
+  """
+  sampled_tokens_ref[...] = top_p_and_sample_arrays(
+    topk_logits=topk_logits_ref[...],
+    topk_idx=topk_idx_ref[...],
+    rng_key=rng_key_ref,  # SMEM, so keep as ref
+    top_p=top_p_ref[...],
+    temperature=temperature_ref[...],
+    vocab_size=vocab_size,
+    replace_val=replace_val,
+    sampling_eps=sampling_eps,
+    min_p=min_p_ref[...] if has_min_p else None,
+    dim0_offset=dim0_offset_ref[0],  # Extract scalar from SMEM array
+    seeds=seeds_ref[...] if has_seeds else None,
+    positions=positions_ref[...] if has_positions else None,
+  )
+
+
+def _top_p_and_sample(
+  topk_logits: jax.Array,
+  topk_idx: jax.Array,
+  rng_key: jax.Array,  # threefry2x32 key
+  top_p: jax.Array,
+  temperature: jax.Array,
+  *,
+  vocab_size: int,
+  replace_val: float,
+  sampling_eps: float,
+  min_p: jax.Array | None = None,
+  seeds: jax.Array | None = None,
+  positions: jax.Array | None = None,
+  interpret: bool = False,
+  dim0_offset: int = 0,
+) -> jax.Array:
+  """
+  Fused TPU kernel for sampling with top-p filtering, min-p filtering, and temperature scaling.
+
+  Supports batch-invariant sampling when seeds and positions are provided.
+
+  Args:
+      topk_logits: Sorted logits of shape (batch_size, k)
+      topk_idx: Indices corresponding to sorted logits of shape (batch_size, k)
+      rng_key: RNG key for sampling, shape (2,)
+      top_p: Top-p threshold values, scalar or shape (batch_size,)
+      temperature: Temperature values, scalar or shape (batch_size,)
+      vocab_size: Vocabulary size for sampling
+      replace_val: Value to replace filtered logits with
+      sampling_eps: if temperature below eps, greedy token is taken
+      min_p: Minimum probability threshold values, scalar or shape (batch_size,). Optional.
+      seeds: Optional batch-specific seeds for batch-invariant sampling.
+      positions: Optional sequence positions for batch-invariant sampling.
+      interpret: If True, run in CPU interpret mode (default: False)
+      dim0_offset: Offset for dim0 (batch) axis, used for sharding (default: 0)
+                   Must be computed outside pallas_call using lax.axis_index
+
+  Returns:
+      next_tokens: Sampled tokens of shape (batch_size,)
+  """
+  # Always include all in_specs and args; use dummy arrays for None parameters
+  # to maintain consistent pallas_call signature
+  batch_size = topk_logits.shape[0]
+  min_p_arg = min_p if min_p is not None else jnp.zeros((1,), dtype=jnp.float32)
+  seeds_arg = seeds if seeds is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
+  positions_arg = positions if positions is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
+
+  in_specs = (
+    pl.BlockSpec(),
+    pl.BlockSpec(),
+    pl.BlockSpec(memory_space=pltpu.SMEM),
+    pl.BlockSpec(),
+    pl.BlockSpec(),
+    pl.BlockSpec(memory_space=pltpu.SMEM),
+    pl.BlockSpec(),
+    pl.BlockSpec(),
+    pl.BlockSpec(),
+  )
+  args = (
+    topk_logits,
+    topk_idx,
+    rng_key.reshape(1, 2),
+    top_p,
+    temperature,
+    jnp.array(dim0_offset, jnp.int32)[None],
+    min_p_arg,
+    seeds_arg,
+    positions_arg,
+  )
+
+  return pl.pallas_call(
+    functools.partial(
+      top_p_and_sample_refs,
+      vocab_size=vocab_size,
+      replace_val=replace_val,
+      sampling_eps=sampling_eps,
+      has_min_p=(min_p is not None),
+      has_seeds=(seeds is not None),
+      has_positions=(positions is not None),
+    ),
+    in_specs=in_specs,
+    out_shape=jax.ShapeDtypeStruct(topk_logits.shape[:1], jnp.int32),
+    interpret=interpret,
+  )(*args)
+
+
+@functools.partial(
+  jit,
+  static_argnames=(
+    "vocab_size",
+    "replace_val",
+    "sampling_eps",
+    "interpret",
+  ),
+)
+def top_p_and_sample(
+  topk_logits: jax.Array,
+  topk_idx: jax.Array,
+  rng_key: jax.Array,
+  top_p: jax.Array,
+  temperature: jax.Array,
+  *,
+  vocab_size: int,
+  replace_val: float,
+  sampling_eps: float,
+  min_p: jax.Array | None = None,
+  seeds: jax.Array | None = None,
+  positions: jax.Array | None = None,
+  interpret: bool = False,
+) -> jax.Array:
+  """
+  Sharded wrapper for top-p and min-p sampling with custom partitioning.
+
+  Requires all axes except batch dim to be replicated. Batch dim can be sharded.
+
+  Supports batch-invariant sampling when seeds and positions are provided.
+
+  Args:
+      topk_logits: Sorted logits of shape (batch_size, k).
+      topk_idx: Indices corresponding to sorted logits of shape (batch_size, k).
+      rng_key: RNG key for sampling.
+      top_p: Top-p threshold values.
+      temperature: Temperature values.
+      vocab_size: Total vocabulary size.
+      replace_val: Value to replace filtered logits with.
+      sampling_eps: if temperature below eps, greedy token is taken
+      min_p: Minimum probability threshold values. Optional.
+      seeds: Optional batch-specific seeds for batch-invariant sampling.
+      positions: Optional sequence positions for batch-invariant sampling.
+      interpret: If True, run in CPU interpret mode (default: False).
+
+  Returns:
+      Sampled tokens of shape (batch_size,).
+  """
+
+  @custom_partitioning
+  def sharded_top_p_and_sample(
+    topk_logits, topk_idx, rng_key, top_p, temperature, min_p, seeds, positions
+  ):
+    return _top_p_and_sample(
+      topk_logits,
+      topk_idx,
+      rng_key,
+      top_p,
+      temperature,
+      vocab_size=vocab_size,
+      replace_val=replace_val,
+      sampling_eps=sampling_eps,
+      min_p=min_p,
+      seeds=seeds,
+      positions=positions,
+      interpret=interpret,
+    )
+
+  def infer_sharding_from_operands(mesh, arg_shapes, result_shape):
+    # Output follows batch dimension of first input (replicated on other dims)
+    batch_spec = arg_shapes[0].sharding.spec[0]
+    return NamedSharding(mesh, P(batch_spec))
+
+  def partition(mesh, arg_shapes, out_shapes):
+    arg_shardings, out_shardings = jax.tree.map(
+      lambda s: s.sharding, (arg_shapes, out_shapes)
+    )
+    batch_axis_name = arg_shardings[0].spec[0]
+
+    def shmap_fn(topk_logits, topk_idx, rng_key, top_p, temperature, min_p, seeds, positions):
+      # Pass global sharded axis offset to maintain jax.random.categorical sampled values
+      dim0_offset = 0
+      if batch_axis_name is not None:
+        dim0_offset = jax.lax.axis_index(batch_axis_name) * topk_logits.shape[0]
+      return _top_p_and_sample(
+        topk_logits,
+        topk_idx,
+        rng_key,
+        top_p,
+        temperature,
+        vocab_size=vocab_size,
+        replace_val=replace_val,
+        sampling_eps=sampling_eps,
+        min_p=min_p,
+        seeds=seeds,
+        positions=positions,
+        interpret=interpret,
+        dim0_offset=dim0_offset,
+      )
+
+    return mesh, shmap_fn, out_shardings, arg_shardings
+
+  # Always include all parameters in sharding rule; use dummy arrays for None values
+  batch_size = topk_logits.shape[0]
+  min_p_arg = min_p if min_p is not None else jnp.zeros((1,), dtype=jnp.float32)
+  seeds_arg = seeds if seeds is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
+  positions_arg = positions if positions is not None else jnp.zeros((batch_size,), dtype=jnp.int32)
+
+  sharding_rule = "b k, b k, r, b, b, b, b, b -> b"
+
+  sharded_top_p_and_sample.def_partition(
+    infer_sharding_from_operands=infer_sharding_from_operands,
+    partition=partition,
+    sharding_rule=sharding_rule,
+    need_replication_factors=("k", "r"),
+  )
+
+  return sharded_top_p_and_sample(
+    topk_logits, topk_idx, rng_key, top_p, temperature, min_p_arg, seeds_arg, positions_arg
+  )
